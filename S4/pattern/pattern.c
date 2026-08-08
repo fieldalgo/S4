@@ -588,19 +588,19 @@ int shape_get_tangent_cross_segment(const shape *s, const double p0[2], const do
 			const double ratio = (s->vtab.ellipse.halfwidth[0] / s->vtab.ellipse.halfwidth[1]);
 			const double iratio = 1./ratio;
 
-			double p1[2], u[2], isect[4], u1;
+			double p1[2], u[2], isect[4];
 			p1[0] = p0p[0]* ca + p0p[1]*sa;
 			p1[1] = (p0p[0]*-sa + p0p[1]*ca) * ratio;
-			u1 = d0[0]*-sa;
-			u[0] = d0[0]*ca; u[1] = u1 * ratio;
+			u[0] = d0[0]*ca + d0[1]*sa;
+			u[1] = (d0[0]*-sa + d0[1]*ca) * ratio;
 
 			c = intersection_circle_segment(s->vtab.ellipse.halfwidth[0], p1, u, isect, NULL);
 			for(i = 0; i < c; ++i){
 				double L;
-				isect[2*c+1] *= iratio;
-				L = hypot(isect[2*c+0],isect[2*c+1]);
+				isect[2*i+1] *= iratio;
+				L = hypot(isect[2*i+0],isect[2*i+1]);
 				if(0 == L){ L = 1; }
-				*cross += (u[0]*isect[2*c+0] + u1*isect[2*c+1]) / L;
+				*cross += (u[0]*isect[2*i+0] + u[1]*isect[2*i+1]) / L;
 			}
 			break;
 		}
@@ -670,20 +670,20 @@ int shape_get_tangent_cross_segment_tri(const shape *s, const double p0[2], cons
 			const double ratio = (s->vtab.ellipse.halfwidth[0] / s->vtab.ellipse.halfwidth[1]);
 			const double iratio = 1./ratio;
 
-			double p1[2], u[2], isect[4], u1, t[2];
+			double p1[2], u[2], isect[4], t[2];
 			p1[0] = p0p[0]* ca + p0p[1]*sa;
 			p1[1] = (p0p[0]*-sa + p0p[1]*ca) * ratio;
-			u1 = d0[0]*-sa;
-			u[0] = d0[0]*ca; u[1] = u1 * ratio;
+			u[0] = d0[0]*ca + d0[1]*sa;
+			u[1] = (d0[0]*-sa + d0[1]*ca) * ratio;
 
 			c = intersection_circle_segment(s->vtab.ellipse.halfwidth[0], p1, u, isect, t);
 			for(i = 0; i < c; ++i){
 				double L;
-				isect[2*c+1] *= iratio;
-				L = hypot(isect[2*c+0],isect[2*c+1]);
+				isect[2*i+1] *= iratio;
+				L = hypot(isect[2*i+0],isect[2*i+1]);
 				if(0 == L){ L = 1; }
-				*cross0 += t[i]*(u[0]*isect[2*c+0] + u1*isect[2*c+1]) / L;
-				*cross1 += (1-t[i])*(u[0]*isect[2*c+0] + u1*isect[2*c+1]) / L;
+				*cross0 += t[i]*(u[0]*isect[2*i+0] + u[1]*isect[2*i+1]) / L;
+				*cross1 += (1-t[i])*(u[0]*isect[2*i+0] + u[1]*isect[2*i+1]) / L;
 			}
 			break;
 		}
