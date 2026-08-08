@@ -339,16 +339,23 @@ int excitation_converter(PyObject *obj, S4Excitation_Data *data)
 			PyErr_SetString(PyExc_TypeError, "the G index must be a integer.");
 			return 0;
 		}
-		data->exg[2 * i + 0] = PyInt_AsLong(pj);
+		data->exg[2 * i + 0] = PyLong_AsLong(pj);
 
 		//get polarization: 'x' or 'y'
 		pj = PyTuple_GetItem(pi, 1);
-		if(!PyString_Check(pj))
-		{
+		/* Python 2's PyString was the bytes/str type, and existing S4 scripts
+		   write the bare literal 'x'. Under Python 3 that literal is str, so
+		   accept str in addition to bytes. This only widens the accepted set:
+		   no input that used to be valid is rejected. */
+		if(PyUnicode_Check(pj)){
+			pol = (char*)PyUnicode_AsUTF8AndSize(pj, &polLen);
+			if(NULL == pol){ return 0; }
+		}else if(PyBytes_Check(pj)){
+			PyBytes_AsStringAndSize(pj, &pol, &polLen);
+		}else{
 			PyErr_SetString(PyExc_TypeError, "polalization should be specified by 'x' or 'y'.");
 			return 0;
 		}
-		PyString_AsStringAndSize(pj, &pol, &polLen);
 		if(1 != polLen || ('x' != pol[0] && 'y' != pol[0]))
 		{
 			PyErr_SetString(PyExc_TypeError, "polalization should be specified by 'x' or 'y'.");
