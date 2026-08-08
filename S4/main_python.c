@@ -844,7 +844,10 @@ static PyObject *S4Sim_SetRegionCircle(S4Sim *self, PyObject *args, PyObject *kw
 		PyErr_Format(PyExc_RuntimeError, "SetRegionCircle: S4_Layer named '%s' not found.", layername);
 		return NULL;
 	}
-	if(NULL != layer->copy){
+	/* layer->copy is an S4_LayerID now. A non-copy layer stores -1, and id 0
+	   is a perfectly valid layer, so the old "!= NULL" test was true for
+	   every ordinary layer. This is the predicate S4_Layer_IsCopy uses. */
+	if(layer->copy >= 0){
 		PyErr_Format(PyExc_RuntimeError, "SetRegionCircle: Cannot pattern a layer copy.");
 		return NULL;
 	}
@@ -876,7 +879,10 @@ static PyObject *S4Sim_SetRegionEllipse(S4Sim *self, PyObject *args, PyObject *k
 		PyErr_Format(PyExc_RuntimeError, "SetRegionEllipse: S4_Layer named '%s' not found.", layername);
 		return NULL;
 	}
-	if(NULL != layer->copy){
+	/* layer->copy is an S4_LayerID now. A non-copy layer stores -1, and id 0
+	   is a perfectly valid layer, so the old "!= NULL" test was true for
+	   every ordinary layer. This is the predicate S4_Layer_IsCopy uses. */
+	if(layer->copy >= 0){
 		PyErr_Format(PyExc_RuntimeError, "SetRegionEllipse: Cannot pattern a layer copy.");
 		return NULL;
 	}
@@ -908,7 +914,10 @@ static PyObject *S4Sim_SetRegionRectangle(S4Sim *self, PyObject *args, PyObject 
 		PyErr_Format(PyExc_RuntimeError, "SetRegionRectangle: S4_Layer named '%s' not found.", layername);
 		return NULL;
 	}
-	if(NULL != layer->copy){
+	/* layer->copy is an S4_LayerID now. A non-copy layer stores -1, and id 0
+	   is a perfectly valid layer, so the old "!= NULL" test was true for
+	   every ordinary layer. This is the predicate S4_Layer_IsCopy uses. */
+	if(layer->copy >= 0){
 		PyErr_Format(PyExc_RuntimeError, "SetRegionRectangle: Cannot pattern a layer copy.");
 		return NULL;
 	}
@@ -941,7 +950,10 @@ static PyObject *S4Sim_SetRegionPolygon(S4Sim *self, PyObject *args, PyObject *k
 		PyErr_Format(PyExc_RuntimeError, "SetRegionPolygon: S4_Layer named '%s' not found.", layername);
 		return NULL;
 	}
-	if(NULL != layer->copy){
+	/* layer->copy is an S4_LayerID now. A non-copy layer stores -1, and id 0
+	   is a perfectly valid layer, so the old "!= NULL" test was true for
+	   every ordinary layer. This is the predicate S4_Layer_IsCopy uses. */
+	if(layer->copy >= 0){
 		PyErr_Format(PyExc_RuntimeError, "SetRegionPolygon: Cannot pattern a layer copy.");
 		return NULL;
 	}
