@@ -98,7 +98,16 @@ inline int Eigensystem(size_t n,
 	integer info;
 
 	if((size_t)-1 == lwork_){
-		RNP_FORTRAN_NAME(zgeev,ZGEEV)(jobvl, jobvr, n, a, lda, eval, vl, ldvl, vr, ldvr, work_, -1, rwork_, &info);
+		/* A workspace query still has to be handed a real rwork array. LAPACK's
+		   ZGEEV forwards rwork to ZTREVC3, which writes into it even when
+		   LWORK == -1, so a NULL rwork faults on current LAPACK/OpenBLAS.
+		   ZGEEV documents rwork as dimension 2*N. The buffer is pure scratch --
+		   the only result a query returns is work_[0] -- so supplying it
+		   changes no computed value. */
+		double *rwork_query = rwork_;
+		if(NULL == rwork_query){ rwork_query = new double[2*n]; }
+		RNP_FORTRAN_NAME(zgeev,ZGEEV)(jobvl, jobvr, n, a, lda, eval, vl, ldvl, vr, ldvr, work_, -1, rwork_query, &info);
+		if(NULL == rwork_){ delete [] rwork_query; }
 		return 0;
 	}
 	

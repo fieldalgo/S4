@@ -316,11 +316,47 @@ S4_Simulation* S4_Simulation_Clone(const S4_Simulation *S){
 
 	memcpy(T, S, sizeof(S4_Simulation));
 
+	/* The memcpy above copied every owning pointer in S, so T currently aliases
+	 * memory S will free.  Detach all of it before anything touches T.  In
+	 * particular the counts have to go back to zero: the loops below add the
+	 * materials and layers with S4_Simulation_SetMaterial/SetLayer, which append
+	 * at the current count, so leaving the counts at S's values would leave the
+	 * first n entries of each fresh array uninitialised -- and the first name
+	 * lookup on the clone would then strcmp against a wild pointer.
+	 *
+	 * Zeroing solution and field_cache here rather than at the end also matters:
+	 * S4_Simulation_SetLayer calls Simulation_DestroySolution, which would
+	 * otherwise free S's solution out from under it on the first layer added. */
+	T->solution = NULL;
+	T->field_cache = NULL;
+	T->n_materials = 0;
+	T->n_layers = 0;
+
+	T->G = (int*)S4_malloc(sizeof(int) * 2*S->n_G);
+	memcpy(T->G, S->G, sizeof(int) * 2*S->n_G);
+	T->kx = (double*)S4_malloc(sizeof(double) * 2*S->n_G);
+	memcpy(T->kx, S->kx, sizeof(double) * 2*S->n_G);
+	T->ky = T->kx + S->n_G;
+
+	if(NULL != S->options.vector_field_dump_filename_prefix){
+		T->options.vector_field_dump_filename_prefix =
+			strdup(S->options.vector_field_dump_filename_prefix);
+	}
+
 	T->n_materials_alloc = S->n_materials_alloc;
 	T->material = (S4_Material*)malloc(sizeof(S4_Material) * T->n_materials_alloc);
 	for(int i = 0; i < S->n_materials; ++i){
 		const S4_Material *M = &(S->material[i]);
-		S4_Simulation_SetMaterial(T, -1, M->name, M->type, &M->eps.abcde[0]);
+		/* M->type is the internal encoding (0 scalar, 1 tensor); the setter
+		 * takes an S4_MATERIAL_TYPE_* constant, which starts at 2.  Passing the
+		 * internal value lands in the switch's default branch, where the setter
+		 * discards the material it just appended and copies no epsilon at all.
+		 * Both forms are read through the eps union, which overlays s[2] on
+		 * abcde[10], so the complex spellings cover the real ones exactly. */
+		const int type = (0 == M->type)
+			? S4_MATERIAL_TYPE_SCALAR_COMPLEX
+			: S4_MATERIAL_TYPE_XYTENSOR_COMPLEX;
+		S4_Simulation_SetMaterial(T, -1, M->name, type, &M->eps.abcde[0]);
 	}
 
 	T->n_layers_alloc = S->n_layers_alloc;
@@ -333,14 +369,21 @@ S4_Simulation* S4_Simulation_Clone(const S4_Simulation *S){
 		L2->pattern.nshapes = L->pattern.nshapes;
 		L2->pattern.shapes = (shape*)malloc(sizeof(shape)*L->pattern.nshapes);
 		memcpy(L2->pattern.shapes, L->pattern.shapes, sizeof(shape)*L->pattern.nshapes);
+		/* A polygon shape owns its vertex array, and Layer_Destroy frees it, so
+		 * the shallow copy above has to be deepened for those. */
+		for(int j = 0; j < L->pattern.nshapes; ++j){
+			if(POLYGON == L->pattern.shapes[j].type && NULL != L->pattern.shapes[j].vtab.polygon.vertex){
+				const int nv = L->pattern.shapes[j].vtab.polygon.n_vertices;
+				double *v = (double*)S4_malloc(sizeof(double) * 2*nv);
+				memcpy(v, L->pattern.shapes[j].vtab.polygon.vertex, sizeof(double) * 2*nv);
+				L2->pattern.shapes[j].vtab.polygon.vertex = v;
+			}
+		}
 		L2->pattern.parent = NULL;
 		L2->modes = NULL;
 	}
 
 	Simulation_CopyExcitation(S, T);
-
-	T->solution = NULL;
-	T->field_cache = NULL;
 
 	S4_TRACE("< S4_Simulation_Clone [omega=%f]\n", S->omega[0]);
 	return T;
@@ -1255,6 +1298,34 @@ int Simulation_AddLayerPatternPolygon(
 // 14 - no layers
 // 15 - material not found
 // 16 - invalid 1D layer patterning
+
+/* Copy a caller-supplied name into a fixed field for a diagnostic message.
+ *
+ * Two things go wrong without this.  The name is unbounded, so a long one fills
+ * the message buffer and the sentence is cut instead -- and the part that says
+ * what is actually wrong is at the end, so the reader is left with the name and
+ * no complaint.  And the cut is byte-wise, so it lands inside a multi-byte
+ * character whenever the name is not ASCII; Python renders the remains as
+ * U+FFFD.  A layer named with 80 Hangul syllables produced both at once.
+ *
+ * The name is cut instead, on a UTF-8 character boundary, with a marker so the
+ * reader can see that it was.  Bytes 0x80-0xBF are continuation bytes, so
+ * stepping back off them lands on a character start; the loop terminates at 0
+ * for any input, well-formed or not.
+ */
+static void S4_ElideName(char *dst, size_t dstlen, const char *src){
+	static const char marker[] = "...";
+	size_t n;
+	if(0 == dstlen){ return; }
+	if(NULL == src){ dst[0] = '\0'; return; }
+	n = strlen(src);
+	if(n < dstlen){ memcpy(dst, src, n+1); return; }
+	n = dstlen - sizeof(marker);	/* sizeof counts the marker's own terminator */
+	while(n > 0 && 0x80 == (((unsigned char)src[n]) & 0xC0)){ --n; }
+	memcpy(dst, src, n);
+	memcpy(dst+n, marker, sizeof(marker));
+}
+
 int Simulation_InitSolution(S4_Simulation *S){
 	S4_TRACE("> Simulation_InitSolution(S=%p) [omega=%f]\n", S, S->omega[0]);
 
@@ -1268,6 +1339,30 @@ int Simulation_InitSolution(S4_Simulation *S){
 		}
 		S4_TRACE("< Simulation_InitSolution (failed; S->n_G < 1) [omega=%f]\n", S->omega[0]);
 		return 9;
+	}
+
+	{ /* A lattice whose basis vectors are parallel spans no area, so it has no
+	   * reciprocal and the whole calculation is undefined.  S4_Lattice_Reciprocate
+	   * already detects it and returns 1 (parallel) or 2 (both zero); the caller
+	   * in S4_Simulation_New ignores the return, and the code that would have
+	   * reported it is commented out there.  What the caller sees instead is a
+	   * layer eigensystem that LAPACK refuses -- on stderr, not as an error --
+	   * and NaN for every result.
+	   *
+	   * A zero second vector is not degenerate: that is how a 1D lattice is
+	   * written, and Reciprocate handles it. */
+		S4_real Lk[4];
+		const int bad = S4_Lattice_Reciprocate(S->Lr, Lk);
+		if(0 != bad){
+			if(NULL != S->msg){
+				S->msg(S->msgdata, "Simulation_InitSolution", S4_MSG_ERROR,
+					(2 == bad) ? "Both lattice vectors are zero"
+					           : "The lattice basis vectors are parallel, so the "
+					             "unit cell has no area");
+			}
+			S4_TRACE("< Simulation_InitSolution (failed; degenerate lattice) [omega=%f]\n", S->omega[0]);
+			return 21;
+		}
 	}
 
 	// Check that every material referenced exists // no, we are sure due to way we added patterns
@@ -1293,17 +1388,30 @@ int Simulation_InitSolution(S4_Simulation *S){
 				S4_TRACE("< Simulation_InitSolution (failed; could not find layer %d is referenced by a copy) [omega=%f]\n", L->copy, S->omega[0]);
 				return 10;
 			}
-		}else{
-			/*
-			// check that no duplicate names exist
-			for(int j = 0; j < i; ++j){
-				const S4_Layer *L2 = &(S->layer[j]);
-				if(0 == strcmp(L2->name, L->name)){
-					S4_TRACE("< Simulation_InitSolution (failed; layer name %s appears more than once) [omega=%f]\n", L->name, S->omega[0]);
-					return 12;
+		}
+		/* Two layers of the same name both enter the stack and change the
+		 * answer, but every lookup resolves to the first, so the second cannot
+		 * be addressed, patterned or measured.  Upstream reserved code 12 for
+		 * this and left the check commented out; it also sat inside the
+		 * non-copy branch, which would have let copies collide.
+		 *
+		 * Redefining a layer is what SetLayer is for, so a repeated name from
+		 * AddLayer is a mistake rather than an idiom. */
+		for(int j = 0; j < i; ++j){
+			const S4_Layer *L2 = &(S->layer[j]);
+			if(NULL != L2->name && NULL != L->name
+			&& 0 == strcmp(L2->name, L->name)){
+				if(NULL != S->msg){
+					char buffer[256], lname[96];
+					S4_ElideName(lname, sizeof(lname), L->name);
+					snprintf(buffer, sizeof(buffer),
+						"Layers %d and %d are both named '%s'; use SetLayer to "
+						"redefine a layer", j+1, i+1, lname);
+					S->msg(S->msgdata, "Simulation_InitSolution", S4_MSG_ERROR, buffer);
 				}
+				S4_TRACE("< Simulation_InitSolution (failed; layer name %s appears more than once) [omega=%f]\n", L->name, S->omega[0]);
+				return 12;
 			}
-			*/
 		}
 		if(!found_ex_layer && L == S->exc.layer){
 			found_ex_layer = true;
@@ -1315,15 +1423,130 @@ int Simulation_InitSolution(S4_Simulation *S){
 					return 16;
 				}
 			}
+			/* A 1D pattern is a set of intervals on the x axis, and the transform
+			 * adds each one's contribution against the layer background.  Nothing
+			 * represents one interval sitting inside another, and the containment
+			 * tree cannot supply it either: a 1D region is written with a zero
+			 * second half-width, so its area is zero and shape_contains_point
+			 * rejects every point.  Overlapping intervals therefore double-count
+			 * the shared part -- silently, and whether the overlap is partial or
+			 * total.
+			 *
+			 * Two intervals that merely share an endpoint are fine: they partition
+			 * the cell rather than overlapping it, which is how a region inside
+			 * another has to be spelled in 1D. */
+			const double period = hypot(S->Lr[0], S->Lr[1]);
+			for(int k = 0; k < L->pattern.nshapes; ++k){
+				const shape *a = &L->pattern.shapes[k];
+				const double ha = a->vtab.rectangle.halfwidth[0];
+				/* Wider than the cell is the 1D form of meeting one's own repeats.
+				 * Exactly as wide only touches, and tiles the cell correctly. */
+				if(period > 0 && 2*ha > period){
+					if(NULL != S->msg){
+						char buffer[256], lname[96];
+						S4_ElideName(lname, sizeof(lname), L->name);
+						snprintf(buffer, sizeof(buffer),
+							"Region %d of layer '%s' is wider than the lattice "
+							"period, so it overlaps its own periodic image",
+							k+1, lname);
+						S->msg(S->msgdata, "Simulation_InitSolution", S4_MSG_ERROR, buffer);
+					}
+					return 19;
+				}
+				for(int m = k+1; m < L->pattern.nshapes; ++m){
+					const shape *b = &L->pattern.shapes[m];
+					const double reach = ha + b->vtab.rectangle.halfwidth[0];
+					const double sep = fabs(b->center[0] - a->center[0]);
+					if(sep < reach){
+						if(NULL != S->msg){
+							char buffer[256], lname[96];
+							S4_ElideName(lname, sizeof(lname), L->name);
+							snprintf(buffer, sizeof(buffer),
+								"Regions %d and %d of layer '%s' overlap",
+								k+1, m+1, lname);
+							S->msg(S->msgdata, "Simulation_InitSolution", S4_MSG_ERROR, buffer);
+						}
+						return 20;
+					}
+					if(period > 0){
+						/* Separation is periodic: two intervals can sit far apart
+						 * in the cell as written and still meet across the
+						 * boundary.  Comparing raw centres misses exactly that. */
+						double wrapped = fmod(sep, period);
+						if(wrapped > 0.5*period){ wrapped = period - wrapped; }
+						if(wrapped < reach){
+							if(NULL != S->msg){
+								char buffer[256], lname[96];
+								S4_ElideName(lname, sizeof(lname), L->name);
+								snprintf(buffer, sizeof(buffer),
+									"Region %d of layer '%s' overlaps the periodic "
+									"image of region %d", k+1, lname, m+1);
+								S->msg(S->msgdata, "Simulation_InitSolution", S4_MSG_ERROR, buffer);
+							}
+							return 19;
+						}
+					}
+				}
+			}
 		}
 		// Initialize the layer pattern
 		if(NULL != L->pattern.parent){
 			free(L->pattern.parent);
 		}
+		{ /* A region may stick out of the cell, but once the cell is tiled the
+		   * regions must not overlap: the transform would count the shared area
+		   * once per copy.  A circle of radius 0.7 in a 1x1 cell reads a mean
+		   * permittivity of 13.3 where filling the cell with the rod material
+		   * caps at 9.  The overlapping pair is often two different regions, so
+		   * both indices are reported. */
+			int other = 0;
+			const int bad = Pattern_CheckPeriodicOverlap(&L->pattern, S->Lr, &other);
+			if(0 != bad){
+				if(NULL != S->msg){
+					char buffer[256], lname[96];
+					S4_ElideName(lname, sizeof(lname), L->name);
+					if(bad == other){
+						snprintf(buffer, sizeof(buffer),
+							"Region %d of layer '%s' overlaps its own periodic image",
+							bad, lname);
+					}else{
+						snprintf(buffer, sizeof(buffer),
+							"Region %d of layer '%s' overlaps the periodic image of "
+							"region %d", bad, lname, other);
+					}
+					S->msg(S->msgdata, "Simulation_InitSolution", S4_MSG_ERROR, buffer);
+				}
+				return 19;
+			}
+		}
 		L->pattern.parent = (int*)malloc(sizeof(int)*L->pattern.nshapes);
 		int error = Pattern_GetContainmentTree(&L->pattern);
 		if(0 != error){
 			S4_TRACE("< Simulation_InitSolution (failed; Pattern_GetContainmentTree returned %d for layer %s) [omega=%f]\n", error, L->name, S->omega[0]);
+			/* Pattern_GetContainmentTree encodes which shape is at fault in the
+			 * magnitude of its return value: 1..nshapes means shapes[n-1] is
+			 * invalid, nshapes+1..2*nshapes means shapes[n-nshapes-1] crosses
+			 * another.  Handing that straight back would collide with this
+			 * function's own small error codes, so it is folded into two codes
+			 * of its own here. */
+			if(error > 0){
+				const int which = (error <= L->pattern.nshapes) ? 17 : 18;
+				if(NULL != S->msg){
+					/* Both checks run before the shapes are sorted by area, so the
+					 * index is the one the caller counts in: the order the regions
+					 * were added to the layer, from 1. */
+					const int index = (17 == which)
+						? error : error - L->pattern.nshapes;
+					char buffer[256], lname[96];
+					S4_ElideName(lname, sizeof(lname), L->name);
+					snprintf(buffer, sizeof(buffer), (17 == which)
+						? "Region %d of layer '%s' is invalid"
+						: "Region %d of layer '%s' crosses another region",
+						index, lname);
+					S->msg(S->msgdata, "Simulation_InitSolution", S4_MSG_ERROR, buffer);
+				}
+				return which;
+			}
 			return error;
 		}
 	}

@@ -156,7 +156,7 @@ static int shape_contains_point(const shape *s, const double x_[2]){
 	const double ca = cos(s->angle);
 	const double sa = sin(s->angle);
 	x[0] = (x_[0] - s->center[0]) * ca + (x_[1] - s->center[1]) * sa;
-	x[1] = (x_[0] - s->center[1]) *-sa + (x_[1] - s->center[1]) * ca;
+	x[1] = (x_[0] - s->center[0]) *-sa + (x_[1] - s->center[1]) * ca;
 	switch(s->type){
 	case CIRCLE:
 		return x[0]*x[0] + x[1]*x[1] <= s->vtab.circle.radius*s->vtab.circle.radius;
@@ -245,10 +245,10 @@ int shape_get_normal(const shape *s, const double x[2], double n[2]){
 			const double rx = ca*r[0] + sa*r[1];
 			const double ry =-sa*r[0] + ca*r[1];
 			if((fabs(rx)-s->vtab.rectangle.halfwidth[0]) > (fabs(ry)-s->vtab.rectangle.halfwidth[1])){
-				double sgn = (rx > 0. ? 1. : -.1);
+				double sgn = (rx > 0. ? 1. : -1.);
 				n[0] = sgn*ca; n[1] = sgn*sa;
 			}else{
-				double sgn = (ry > 0. ? 1. : -.1);
+				double sgn = (ry > 0. ? 1. : -1.);
 				n[0] = sgn*(-sa); n[1] = sgn*ca;
 			}
 		}
@@ -588,19 +588,19 @@ int shape_get_tangent_cross_segment(const shape *s, const double p0[2], const do
 			const double ratio = (s->vtab.ellipse.halfwidth[0] / s->vtab.ellipse.halfwidth[1]);
 			const double iratio = 1./ratio;
 
-			double p1[2], u[2], isect[4], u1;
+			double p1[2], u[2], isect[4];
 			p1[0] = p0p[0]* ca + p0p[1]*sa;
 			p1[1] = (p0p[0]*-sa + p0p[1]*ca) * ratio;
-			u1 = d0[0]*-sa;
-			u[0] = d0[0]*ca; u[1] = u1 * ratio;
+			u[0] = d0[0]*ca + d0[1]*sa;
+			u[1] = (d0[0]*-sa + d0[1]*ca) * ratio;
 
 			c = intersection_circle_segment(s->vtab.ellipse.halfwidth[0], p1, u, isect, NULL);
 			for(i = 0; i < c; ++i){
 				double L;
-				isect[2*c+1] *= iratio;
-				L = hypot(isect[2*c+0],isect[2*c+1]);
+				isect[2*i+1] *= iratio;
+				L = hypot(isect[2*i+0],isect[2*i+1]);
 				if(0 == L){ L = 1; }
-				*cross += (u[0]*isect[2*c+0] + u1*isect[2*c+1]) / L;
+				*cross += (u[0]*isect[2*i+0] + u[1]*isect[2*i+1]) / L;
 			}
 			break;
 		}
@@ -670,20 +670,20 @@ int shape_get_tangent_cross_segment_tri(const shape *s, const double p0[2], cons
 			const double ratio = (s->vtab.ellipse.halfwidth[0] / s->vtab.ellipse.halfwidth[1]);
 			const double iratio = 1./ratio;
 
-			double p1[2], u[2], isect[4], u1, t[2];
+			double p1[2], u[2], isect[4], t[2];
 			p1[0] = p0p[0]* ca + p0p[1]*sa;
 			p1[1] = (p0p[0]*-sa + p0p[1]*ca) * ratio;
-			u1 = d0[0]*-sa;
-			u[0] = d0[0]*ca; u[1] = u1 * ratio;
+			u[0] = d0[0]*ca + d0[1]*sa;
+			u[1] = (d0[0]*-sa + d0[1]*ca) * ratio;
 
 			c = intersection_circle_segment(s->vtab.ellipse.halfwidth[0], p1, u, isect, t);
 			for(i = 0; i < c; ++i){
 				double L;
-				isect[2*c+1] *= iratio;
-				L = hypot(isect[2*c+0],isect[2*c+1]);
+				isect[2*i+1] *= iratio;
+				L = hypot(isect[2*i+0],isect[2*i+1]);
 				if(0 == L){ L = 1; }
-				*cross0 += t[i]*(u[0]*isect[2*c+0] + u1*isect[2*c+1]) / L;
-				*cross1 += (1-t[i])*(u[0]*isect[2*c+0] + u1*isect[2*c+1]) / L;
+				*cross0 += t[i]*(u[0]*isect[2*i+0] + u[1]*isect[2*i+1]) / L;
+				*cross1 += (1-t[i])*(u[0]*isect[2*i+0] + u[1]*isect[2*i+1]) / L;
 			}
 			break;
 		}
@@ -748,35 +748,452 @@ int shape_valid(const shape *s){
 	return 1;
 }
 
-int shapes_intersect(const shape *s0, const shape *s1){
-	switch(s0->type){
+/* Support for shapes_intersect.
+ *
+ * "Intersect" here means the two boundaries *cross*: the shapes are neither
+ * disjoint nor one strictly inside the other.  That is the case the rest of
+ * this file cannot express, because the containment tree records a single
+ * parent per shape and the Fourier transform then subtracts each shape from
+ * exactly one background.  Shapes that merely touch, share a boundary point, or
+ * nest properly are legal and must not be reported.
+ *
+ * Every test below is one-sided in the safe direction: what it reports is a
+ * crossing that provably exists.  It can miss a crossing so shallow that a
+ * quadratic has no sign change on the segment, or that a 512-point sweep of an
+ * ellipse boundary steps over; it never invents one, so a pattern that S4
+ * accepts today is not rejected unless its boundaries really do cross.
+ */
+
+/* radius of a circle about the shape centre that contains the whole shape */
+static double shape_bounding_radius(const shape *s){
+	switch(s->type){
 	case CIRCLE:
-		switch(s1->type){
-		case CIRCLE:
-			{ /* circle-circle */
-				/*return hypot(s1->center[0]-s0->center[0], s1->center[1]-s0->center[1]) <= s0->vtab.circle.radius + s1->vtab.circle.radius;*/
-			}
-			break;
-		case ELLIPSE:
-			break;
-		case RECTANGLE:
-			break;
-		case POLYGON:
-			break;
-		default:
-			return 0;
-		}
-		break;
+		return s->vtab.circle.radius;
 	case ELLIPSE:
-		break;
+		return (s->vtab.ellipse.halfwidth[0] > s->vtab.ellipse.halfwidth[1]
+			? s->vtab.ellipse.halfwidth[0] : s->vtab.ellipse.halfwidth[1]);
 	case RECTANGLE:
-		break;
+		return hypot(s->vtab.rectangle.halfwidth[0], s->vtab.rectangle.halfwidth[1]);
 	case POLYGON:
-		break;
+		{
+			double r2 = 0.;
+			int i;
+			for(i = 0; i < s->vtab.polygon.n_vertices; ++i){
+				const double x = s->vtab.polygon.vertex[2*i+0];
+				const double y = s->vtab.polygon.vertex[2*i+1];
+				const double d2 = x*x + y*y;
+				if(d2 > r2){ r2 = d2; }
+			}
+			return sqrt(r2);
+		}
 	default:
-		return 0;
+		return 0.;
+	}
+}
+
+static int shape_is_polygonal(const shape *s){
+	return (RECTANGLE == s->type || POLYGON == s->type);
+}
+
+static int shape_n_boundary_vertices(const shape *s){
+	if(RECTANGLE == s->type){ return 4; }
+	return s->vtab.polygon.n_vertices;
+}
+
+/* k-th boundary vertex of a polygonal shape, in the global frame */
+static void shape_boundary_vertex(const shape *s, int k, double v[2]){
+	static const double corner[4][2] = {{1,1},{-1,1},{-1,-1},{1,-1}};
+	const double ca = cos(s->angle);
+	const double sa = sin(s->angle);
+	double l[2];
+	if(RECTANGLE == s->type){
+		l[0] = corner[k][0] * s->vtab.rectangle.halfwidth[0];
+		l[1] = corner[k][1] * s->vtab.rectangle.halfwidth[1];
+	}else{
+		l[0] = s->vtab.polygon.vertex[2*k+0];
+		l[1] = s->vtab.polygon.vertex[2*k+1];
+	}
+	v[0] = s->center[0] + ca*l[0] - sa*l[1];
+	v[1] = s->center[1] + sa*l[0] + ca*l[1];
+}
+
+/* Map a global point into the frame where the conic (circle or ellipse) is the
+ * unit circle, so that |w|^2 - 1 is negative inside and positive outside. */
+static void shape_conic_normalize(const shape *s, const double p[2], double w[2]){
+	const double ca = cos(s->angle);
+	const double sa = sin(s->angle);
+	const double dx = p[0] - s->center[0];
+	const double dy = p[1] - s->center[1];
+	const double u =  ca*dx + sa*dy;
+	const double v = -sa*dx + ca*dy;
+	if(CIRCLE == s->type){
+		const double r = s->vtab.circle.radius;
+		w[0] = u/r; w[1] = v/r;
+	}else{
+		w[0] = u/s->vtab.ellipse.halfwidth[0];
+		w[1] = v/s->vtab.ellipse.halfwidth[1];
+	}
+}
+
+/* Point on a conic's boundary at parameter t in [0,1), in the global frame */
+static void shape_conic_boundary_point(const shape *s, double t, double p[2]){
+	const double th = 2.*M_PI*t;
+	const double ca = cos(s->angle);
+	const double sa = sin(s->angle);
+	double l[2];
+	if(CIRCLE == s->type){
+		l[0] = s->vtab.circle.radius*cos(th);
+		l[1] = s->vtab.circle.radius*sin(th);
+	}else{
+		l[0] = s->vtab.ellipse.halfwidth[0]*cos(th);
+		l[1] = s->vtab.ellipse.halfwidth[1]*sin(th);
+	}
+	p[0] = s->center[0] + ca*l[0] - sa*l[1];
+	p[1] = s->center[1] + sa*l[0] + ca*l[1];
+}
+
+/* Which side of the line ab does c fall on: +1, -1, or 0 for "on it".
+ *
+ * The determinant has units of area, so it cannot be tested against a fixed
+ * epsilon; it is compared against the size of the two products that formed it,
+ * which is what bounds the rounding error in their difference.  Without that, a
+ * point lying on the line to within rounding gets a confident sign from
+ * whatever its last bits happened to be.
+ *
+ * This is not a corner case.  Any geometry that came out of a clipper -- and a
+ * design with overlapping shapes has to be resolved by one before S4 will take
+ * it -- abuts along shared edges whose two sides were computed separately.  A
+ * resolved pair from an independent implementation's case suite produced
+ * determinants of
+ * 4e-18 and 6e-17 where zero was meant, against terms of order 0.35, and was
+ * reported as a transversal crossing. */
+#define SHAPE_ORIENT_TOL 1e-12
+static int orient2_sign(const double a[2], const double b[2], const double c[2]){
+	const double t0 = (b[0]-a[0])*(c[1]-a[1]);
+	const double t1 = (b[1]-a[1])*(c[0]-a[0]);
+	const double det = t0 - t1;
+	const double mag = fabs(t0) + fabs(t1);
+	if(fabs(det) <= SHAPE_ORIENT_TOL * mag){ return 0; }
+	return (det > 0. ? 1 : -1);
+}
+
+/* Do the two open segments cross transversally?  Touching at an endpoint,
+ * collinear overlap, and an endpoint lying on the other segment all answer no:
+ * none of them is a crossing of the interiors. */
+static int segments_properly_cross(
+	const double p0[2], const double p1[2],
+	const double q0[2], const double q1[2]
+){
+	const int d0 = orient2_sign(p0, p1, q0);
+	const int d1 = orient2_sign(p0, p1, q1);
+	const int e0 = orient2_sign(q0, q1, p0);
+	const int e1 = orient2_sign(q0, q1, p1);
+	/* every endpoint strictly off the other line, and the two pairs opposed */
+	return (0 != d0 && d0 == -d1) && (0 != e0 && e0 == -e1);
+}
+
+/* Does the open segment p0->p1 cross the boundary of the conic s?
+ *
+ * In the conic's normalised frame the segment is affine in t, so |w(t)|^2 - 1
+ * is a quadratic; a root strictly inside (0,1) is a crossing.  Solving it is
+ * exact, and the strict interval keeps an endpoint that merely lands on the
+ * boundary from counting. */
+static int segment_crosses_conic(const shape *s, const double p0[2], const double p1[2]){
+	double w0[2], w1[2], d[2];
+	double A, B, C, disc, sq, t0, t1;
+	shape_conic_normalize(s, p0, w0);
+	shape_conic_normalize(s, p1, w1);
+	d[0] = w1[0] - w0[0];
+	d[1] = w1[1] - w0[1];
+	A = d[0]*d[0] + d[1]*d[1];
+	if(!(A > 0.)){ return 0; }
+	B = 2.*(w0[0]*d[0] + w0[1]*d[1]);
+	C = w0[0]*w0[0] + w0[1]*w0[1] - 1.;
+	disc = B*B - 4.*A*C;
+	/* Tangency lands on disc == 0 and reaches here as a few ulps of either
+	 * sign, so the test is relative to the terms that formed the difference.
+	 * A segment that grazes the conic is not a crossing. */
+	if(!(disc > SHAPE_ORIENT_TOL * (B*B + 4.*fabs(A*C)))){ return 0; }
+	sq = sqrt(disc);
+	t0 = (-B - sq)/(2.*A);
+	t1 = (-B + sq)/(2.*A);
+	return (t0 > 0. && t0 < 1.) || (t1 > 0. && t1 < 1.);
+}
+
+/* Two conics: sweep one boundary and look for a strict sign change of the
+ * other's implicit function.  A sign change is a crossing; the converse needs
+ * the sweep to be fine enough, which is the one-sidedness noted above. */
+#define SHAPE_CONIC_SWEEP 512
+static int conics_cross(const shape *a, const shape *b){
+	int i, inside = 0, outside = 0;
+	for(i = 0; i < SHAPE_CONIC_SWEEP; ++i){
+		double p[2], w[2], f;
+		shape_conic_boundary_point(b, (double)i/(double)SHAPE_CONIC_SWEEP, p);
+		shape_conic_normalize(a, p, w);
+		f = w[0]*w[0] + w[1]*w[1] - 1.;
+		/* f is dimensionless and 0 on the boundary; a sample that lands on the
+		 * other shape's boundary must not be counted as either side, or two
+		 * internally tangent conics read as crossing. */
+		if(f > SHAPE_ORIENT_TOL){ outside = 1; }
+		else if(f < -SHAPE_ORIENT_TOL){ inside = 1; }
+		if(inside && outside){ return 1; }
 	}
 	return 0;
+}
+
+static int polygonal_crosses_conic(const shape *poly, const shape *con){
+	const int n = shape_n_boundary_vertices(poly);
+	int i;
+	for(i = 0; i < n; ++i){
+		double v0[2], v1[2];
+		shape_boundary_vertex(poly, i, v0);
+		shape_boundary_vertex(poly, (i+1) % n, v1);
+		if(segment_crosses_conic(con, v0, v1)){ return 1; }
+	}
+	return 0;
+}
+
+static int polygonals_cross(const shape *s0, const shape *s1){
+	const int n0 = shape_n_boundary_vertices(s0);
+	const int n1 = shape_n_boundary_vertices(s1);
+	int i, j;
+	for(i = 0; i < n0; ++i){
+		double a0[2], a1[2];
+		shape_boundary_vertex(s0, i, a0);
+		shape_boundary_vertex(s0, (i+1) % n0, a1);
+		for(j = 0; j < n1; ++j){
+			double b0[2], b1[2];
+			shape_boundary_vertex(s1, j, b0);
+			shape_boundary_vertex(s1, (j+1) % n1, b1);
+			if(segments_properly_cross(a0, a1, b0, b1)){ return 1; }
+		}
+	}
+	return 0;
+}
+
+static int boundaries_cross(const shape *s0, const shape *s1){
+	if(shape_is_polygonal(s0)){
+		if(shape_is_polygonal(s1)){
+			return polygonals_cross(s0, s1);
+		}
+		return polygonal_crosses_conic(s0, s1);
+	}
+	if(shape_is_polygonal(s1)){
+		return polygonal_crosses_conic(s1, s0);
+	}
+	return conics_cross(s0, s1);
+}
+
+/* Axis-aligned bounding box of a shape, in the global frame. */
+static void shape_bounding_box(const shape *s, double lo[2], double hi[2]){
+	double ex, ey;
+	const double ca = fabs(cos(s->angle));
+	const double sa = fabs(sin(s->angle));
+	switch(s->type){
+	case CIRCLE:
+		ex = ey = s->vtab.circle.radius;
+		break;
+	case ELLIPSE:
+		{
+			const double a = s->vtab.ellipse.halfwidth[0];
+			const double c = s->vtab.ellipse.halfwidth[1];
+			ex = hypot(a*ca, c*sa);
+			ey = hypot(a*sa, c*ca);
+		}
+		break;
+	case RECTANGLE:
+		ex = s->vtab.rectangle.halfwidth[0]*ca + s->vtab.rectangle.halfwidth[1]*sa;
+		ey = s->vtab.rectangle.halfwidth[0]*sa + s->vtab.rectangle.halfwidth[1]*ca;
+		break;
+	case POLYGON:
+		{
+			int i;
+			double xlo = 0., xhi = 0., ylo = 0., yhi = 0.;
+			for(i = 0; i < s->vtab.polygon.n_vertices; ++i){
+				double v[2];
+				shape_boundary_vertex(s, i, v);
+				v[0] -= s->center[0];
+				v[1] -= s->center[1];
+				if(0 == i || v[0] < xlo){ xlo = v[0]; }
+				if(0 == i || v[0] > xhi){ xhi = v[0]; }
+				if(0 == i || v[1] < ylo){ ylo = v[1]; }
+				if(0 == i || v[1] > yhi){ yhi = v[1]; }
+			}
+			lo[0] = s->center[0] + xlo; hi[0] = s->center[0] + xhi;
+			lo[1] = s->center[1] + ylo; hi[1] = s->center[1] + yhi;
+			return;
+		}
+	default:
+		ex = ey = 0.;
+		break;
+	}
+	lo[0] = s->center[0] - ex; hi[0] = s->center[0] + ex;
+	lo[1] = s->center[1] - ey; hi[1] = s->center[1] + ey;
+}
+
+/* Sample the interior of s on a grid and record whether any sampled point is
+ * also inside `other`, and whether any is not. */
+#define SHAPE_INTERIOR_GRID 32
+static void shape_sample_interior(
+	const shape *s, const shape *other, int *in_both, int *in_only
+){
+	const double R = shape_bounding_radius(s);
+	int i, j;
+	*in_both = 0;
+	*in_only = 0;
+	for(i = 0; i < SHAPE_INTERIOR_GRID; ++i){
+		for(j = 0; j < SHAPE_INTERIOR_GRID; ++j){
+			double p[2];
+			p[0] = s->center[0] + R*(2.*((double)i+0.5)/SHAPE_INTERIOR_GRID - 1.);
+			p[1] = s->center[1] + R*(2.*((double)j+0.5)/SHAPE_INTERIOR_GRID - 1.);
+			if(!shape_contains_point(s, p)){ continue; }
+			if(shape_contains_point(other, p)){ *in_both = 1; }else{ *in_only = 1; }
+			if(*in_both && *in_only){ return; }
+		}
+	}
+}
+
+/* Is any point interior to both shapes?
+ *
+ * Searched over the intersection of the two bounding boxes rather than over
+ * either shape, which is what makes a thin overlap findable: two rectangles
+ * that share a 0.01-wide strip have a bounding-box intersection 0.01 wide, so
+ * the same grid lands on it hundreds of times over instead of stepping across
+ * it.  Searching each shape's own box, as this used to, gives a spacing set by
+ * the shape's size and misses anything narrower than that. */
+#define SHAPE_OVERLAP_GRID 48
+static int shapes_share_interior(const shape *s0, const shape *s1){
+	double lo0[2], hi0[2], lo1[2], hi1[2], lo[2], hi[2];
+	int i, j;
+	shape_bounding_box(s0, lo0, hi0);
+	shape_bounding_box(s1, lo1, hi1);
+	for(i = 0; i < 2; ++i){
+		lo[i] = (lo0[i] > lo1[i] ? lo0[i] : lo1[i]);
+		hi[i] = (hi0[i] < hi1[i] ? hi0[i] : hi1[i]);
+		if(!(hi[i] > lo[i])){ return 0; } /* boxes miss: nothing to share */
+	}
+	for(i = 0; i < SHAPE_OVERLAP_GRID; ++i){
+		for(j = 0; j < SHAPE_OVERLAP_GRID; ++j){
+			double p[2];
+			p[0] = lo[0] + (hi[0]-lo[0])*((double)i+0.5)/SHAPE_OVERLAP_GRID;
+			p[1] = lo[1] + (hi[1]-lo[1])*((double)j+0.5)/SHAPE_OVERLAP_GRID;
+			if(shape_contains_point(s0, p) && shape_contains_point(s1, p)){
+				return 1;
+			}
+		}
+	}
+	return 0;
+}
+
+/* Is any point interior to `s` but not to `other`? */
+static int shape_has_exclusive_interior(const shape *s, const shape *other){
+	int both, only;
+	shape_sample_interior(s, other, &both, &only);
+	return only;
+}
+
+/* Two shapes overlap partially -- neither disjoint nor one inside the other --
+ * exactly when they share interior and each also has interior the other does
+ * not.
+ *
+ * Each of the three findings is a witness point, so containment and
+ * disjointness are never misreported: a shape strictly inside another has no
+ * interior outside it, and disjoint shapes share no interior at all.  Shapes
+ * that touch without overlapping are likewise safe, because a point on a
+ * boundary is inside neither shape.
+ *
+ * The shared-interior test is the one that has to resolve a thin sliver, so it
+ * gets the targeted grid; the two exclusive-interior tests are looking for
+ * something large and a coarse sweep of each shape finds it at once. */
+static int shapes_overlap_partially(const shape *s0, const shape *s1){
+	if(!shapes_share_interior(s0, s1)){ return 0; }
+	if(!shape_has_exclusive_interior(s0, s1)){ return 0; }
+	return shape_has_exclusive_interior(s1, s0);
+}
+
+int shapes_intersect(const shape *s0, const shape *s1){
+	const double sep = hypot(s1->center[0] - s0->center[0],
+	                         s1->center[1] - s0->center[1]);
+	if(sep > shape_bounding_radius(s0) + shape_bounding_radius(s1)){
+		return 0; /* too far apart to touch at all */
+	}
+	/* The two tests catch different things and neither subsumes the other.
+	 * The boundary test is exact for a transversal crossing but says no when
+	 * the two boundaries meet along shared collinear edges or only at shared
+	 * vertices -- which is precisely the shape of two equal axis-aligned
+	 * rectangles offset along one axis, the commonest way to write this
+	 * mistake.  The interior test covers that, at the cost of needing the
+	 * overlap to be wide enough for a 32x32 sweep to land in it. */
+	return boundaries_cross(s0, s1) || shapes_overlap_partially(s0, s1);
+}
+
+/* Does any region overlap a periodic image of a region (its own included)?
+ *
+ * A region is allowed to stick out of the unit cell: the Fourier transform is
+ * taken over the shape as given, and for a periodic structure that is right so
+ * long as the shape does not meet its own repeats.  When it does, the transform
+ * counts the shared area once per copy and the structure S4 solves is not the
+ * one that was described.
+ *
+ * It is not a subtle failure.  A circle of radius 0.7 in a 1x1 cell of eps 9 on
+ * an eps 1 background comes out with a mean permittivity of 13.3, when filling
+ * the entire cell with the rod material could not exceed 9.
+ *
+ * Touching an image is fine -- a region spanning the cell exactly meets its
+ * neighbour along a line and shares no area -- and shapes_intersect already
+ * distinguishes that from an overlap.
+ *
+ * The pair need not be one shape twice: a small region near the cell edge can
+ * land inside the image of a large one, and that double-counts just the same.
+ * Both indices are reported so the message can say which case it is.
+ *
+ * Returns the 1-based index of the first offending shape, or 0 for none.
+ */
+int pattern_check_periodic_overlap(
+	int nshapes,
+	const shape *shapes,
+	const double Lr[4],
+	int *other
+){
+	int i, j, a, bb, reach = 1;
+	double rmax = 0., L0, L1;
+	if(NULL != other){ *other = 0; }
+	if(nshapes < 1 || NULL == shapes || NULL == Lr){ return 0; }
+	for(i = 0; i < nshapes; ++i){
+		const double r = shape_bounding_radius(&shapes[i]);
+		if(r > rmax){ rmax = r; }
+	}
+	L0 = hypot(Lr[0], Lr[1]);
+	L1 = hypot(Lr[2], Lr[3]);
+	{ /* how many cells away an image can still be within reach */
+		const double Lmin = (L0 < L1 ? L0 : L1);
+		if(Lmin > 0){
+			reach = (int)(2. * rmax / Lmin) + 1;
+			if(reach < 1){ reach = 1; }
+			if(reach > 8){ reach = 8; }
+		}
+	}
+	for(i = 0; i < nshapes; ++i){
+		for(j = 0; j < nshapes; ++j){
+			for(a = -reach; a <= reach; ++a){
+				for(bb = -reach; bb <= reach; ++bb){
+					shape t;
+					if(0 == a && 0 == bb){ continue; } /* the cell itself */
+					t = shapes[j];  /* vertices are in the shape's own frame */
+					t.center[0] += a*Lr[0] + bb*Lr[2];
+					t.center[1] += a*Lr[1] + bb*Lr[3];
+					if(shapes_intersect(&shapes[i], &t)){
+						if(NULL != other){ *other = j+1; }
+						return i+1;
+					}
+				}
+			}
+		}
+	}
+	return 0;
+}
+int Pattern_CheckPeriodicOverlap(const Pattern *p, const double Lr[4], int *other){
+	return pattern_check_periodic_overlap(p->nshapes, p->shapes, Lr, other);
 }
 
 int pattern_get_containment_tree(
@@ -791,13 +1208,20 @@ int pattern_get_containment_tree(
 	if(NULL == shapes){ return -2; }
 	if(NULL == parent){ return -3; }
 
-	/* We will assume for now that the non-self-intersection criterion is met. */
+	/* Every pair has to be checked: the containment tree can only say that one
+	 * shape is inside another or beside it, so a pair whose boundaries cross is
+	 * not representable and has to be refused rather than silently rounded to
+	 * whichever of the two readings the tree happens to pick.
+	 *
+	 * The loop below used to advance and test i in both positions, which left
+	 * the outer loop finished after one pass and compared shapes[i] against a
+	 * fixed shapes[j] -- including against itself. */
 	if(nshapes > 1){
 		for(i = 0; i < nshapes; ++i){
 			if(!shape_valid(&shapes[i])){ return i+1; }
-			for(j = i+1; i < nshapes; ++i){
+			for(j = i+1; j < nshapes; ++j){
 				if(shapes_intersect(&shapes[i], &shapes[j])){
-					return nshapes+i+1;
+					return nshapes+j+1;
 				}
 			}
 		}

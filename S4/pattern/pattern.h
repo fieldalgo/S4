@@ -106,11 +106,13 @@ typedef struct Pattern_{
  *                     is sorted in order of decreasing area of shapes.
  *    parent   OUT     Length `nshapes'. Gives the immediate containing
  *                     shape of each shape, or -1 if none.
+ * The intersection and validity checks run before the sort, so the indices
+ * below count the shapes in the order they were given.
  * Return values:
  *                           0: If no shapes intersect each other and containment tree
  *                              returned is valid.
  *          0 < n <= nshapes  : If shapes[n-1] is invalid.
- *    nshapes < n <= 2*nshapes: If shapes[n-1] intersects with another shape.
+ *    nshapes < n <= 2*nshapes: If shapes[n-nshapes-1] intersects another shape.
  *                          -n: If n-th argument is invalid.
  */
 int pattern_get_containment_tree(
@@ -121,6 +123,17 @@ int pattern_get_containment_tree(
 /* Convenience version of the above.
  * p->nshapes and p->shapes must be filled in.
  */
+/* Reports a region that overlaps a periodic image of a region (possibly
+ * itself), which the Fourier transform cannot represent: it would count the
+ * shared area once per copy.  Touching an image is not an overlap.
+ * Returns the 1-based index of the first such region, or 0 if none.
+ * If 'other' is not NULL it receives the 1-based index of the region whose
+ * image was hit, which equals the return value when a region meets its own
+ * repeats.  Naming both is what makes the diagnostic actionable: the two are
+ * different regions more often than not.
+ */
+int Pattern_CheckPeriodicOverlap(const Pattern *p, const double Lr[4], int *other);
+
 int Pattern_GetContainmentTree(
 	Pattern *p
 );

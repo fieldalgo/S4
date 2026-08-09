@@ -145,7 +145,17 @@ int FMMGetEpsilon_PolBasisJones(const S4_Simulation *S, const S4_Layer *L, const
 				if(abs(G[2*j+i]) > ngrid[i]){ ngrid[i] = abs(G[2*j+i]); }
 			}
 			if(ngrid[i] < 1){ ngrid[i] = 1; }
+			/* The coefficient read below is Fto[f[1] + f[0]*ngrid[1]] with
+			 * f = G_a - G_b spanning +/- 2*Gmax and only the negative half
+			 * wrapped, so the index is in bounds only while ngrid > 2*Gmax.
+			 * At resolution 2 -- the documented minimum -- the product is
+			 * exactly 2*Gmax whenever it already factors into 2s, 3s and 5s,
+			 * and the read then runs past the end of the buffer.  Raise the
+			 * grid to the smallest size that keeps it inside; every
+			 * resolution of 3 or more is already past this and unaffected. */
+			const int gmax = ngrid[i];
 			ngrid[i] *= S->options.resolution;
+			if(ngrid[i] <= 2*gmax){ ngrid[i] = 2*gmax + 1; }
 			ngrid[i] = fft_next_fast_size(ngrid[i]);
 		}
 		const int ng2 = ngrid[0]*ngrid[1];
@@ -249,9 +259,9 @@ int FMMGetEpsilon_PolBasisJones(const S4_Simulation *S, const S4_Layer *L, const
 		// 00 block: uy
 		{
 			for(ii[1] = 0; ii[1] < ngrid[1]; ++ii[1]){
-				const int si1 = ii[1] >= ngrid[1]/2 ? ii[1]-ngrid[1]/2 : ii[1]+ngrid[1]/2;
+				const int si1 = (ii[1] + ngrid[1]/2) % ngrid[1];
 				for(ii[0] = 0; ii[0] < ngrid[0]; ++ii[0]){
-					const int si0 = ii[0] >= ngrid[0]/2 ? ii[0]-ngrid[0]/2 : ii[0]+ngrid[0]/2;
+					const int si0 = (ii[0] + ngrid[0]/2) % ngrid[0];
 					Ffrom[si1+si0*ngrid[1]] = par[2*(ii[0]+ii[1]*ngrid[0])+1];
 				}
 			}
@@ -268,9 +278,9 @@ int FMMGetEpsilon_PolBasisJones(const S4_Simulation *S, const S4_Layer *L, const
 		// 10 block: -ux
 		{
 			for(ii[1] = 0; ii[1] < ngrid[1]; ++ii[1]){
-				const int si1 = ii[1] >= ngrid[1]/2 ? ii[1]-ngrid[1]/2 : ii[1]+ngrid[1]/2;
+				const int si1 = (ii[1] + ngrid[1]/2) % ngrid[1];
 				for(ii[0] = 0; ii[0] < ngrid[0]; ++ii[0]){
-					const int si0 = ii[0] >= ngrid[0]/2 ? ii[0]-ngrid[0]/2 : ii[0]+ngrid[0]/2;
+					const int si0 = (ii[0] + ngrid[0]/2) % ngrid[0];
 					Ffrom[si1+si0*ngrid[1]] = -par[2*(ii[0]+ii[1]*ngrid[0])+0];
 				}
 			}
@@ -287,9 +297,9 @@ int FMMGetEpsilon_PolBasisJones(const S4_Simulation *S, const S4_Layer *L, const
 		// 01 block: ux*
 		{
 			for(ii[1] = 0; ii[1] < ngrid[1]; ++ii[1]){
-				const int si1 = ii[1] >= ngrid[1]/2 ? ii[1]-ngrid[1]/2 : ii[1]+ngrid[1]/2;
+				const int si1 = (ii[1] + ngrid[1]/2) % ngrid[1];
 				for(ii[0] = 0; ii[0] < ngrid[0]; ++ii[0]){
-					const int si0 = ii[0] >= ngrid[0]/2 ? ii[0]-ngrid[0]/2 : ii[0]+ngrid[0]/2;
+					const int si0 = (ii[0] + ngrid[0]/2) % ngrid[0];
 					Ffrom[si1+si0*ngrid[1]] = std::conj(par[2*(ii[0]+ii[1]*ngrid[0])+0]);
 				}
 			}
@@ -306,9 +316,9 @@ int FMMGetEpsilon_PolBasisJones(const S4_Simulation *S, const S4_Layer *L, const
 		// 11 block: uy*
 		{
 			for(ii[1] = 0; ii[1] < ngrid[1]; ++ii[1]){
-				const int si1 = ii[1] >= ngrid[1]/2 ? ii[1]-ngrid[1]/2 : ii[1]+ngrid[1]/2;
+				const int si1 = (ii[1] + ngrid[1]/2) % ngrid[1];
 				for(ii[0] = 0; ii[0] < ngrid[0]; ++ii[0]){
-					const int si0 = ii[0] >= ngrid[0]/2 ? ii[0]-ngrid[0]/2 : ii[0]+ngrid[0]/2;
+					const int si0 = (ii[0] + ngrid[0]/2) % ngrid[0];
 					Ffrom[si1+si0*ngrid[1]] = std::conj(par[2*(ii[0]+ii[1]*ngrid[0])+1]);
 				}
 			}

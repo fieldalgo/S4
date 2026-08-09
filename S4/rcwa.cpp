@@ -1489,10 +1489,23 @@ printf("Could not allocate %d\n", (int)minwork); fflush(stdout);
 	// hence must be moved to the RHS. This produces in the end a square matrix.
 	
 	// Prepare the RHS
+	//
+	// The two boundary columns land in the same block when there are only two
+	// layers: (nlayers-1)*n4-n2 is n2 for nlayers == 2, so the second Copy
+	// overwrote the first and the incident amplitude was thrown away.  A plain
+	// interface -- air against glass, the simplest structure S4 can express --
+	// came out with no reflection and no transmission, and R+T = 0 rather than
+	// 1, with no error raised.  Both contributions belong to that one block
+	// row, so they are summed.  For three layers or more the two destinations
+	// are distinct and the Copy is what is wanted.
 	Mult(n4, n2, 1., &work[6*n22], n4, &ab[0], 0, t1);
 	Copy(n4, t1, 1, &ab[n2], 1);
 	Mult(n4, n2, 1., &work[6*n22*(nlayers-1)+n2*n4], n4, &ab[(nlayers-1)*n4+n2], 0, t1);
-	Copy(n4, t1, 1, &ab[(nlayers-1)*n4-n2], 1);
+	if(2 == nlayers){
+		Axpy(n4, 1., t1, 1, &ab[(nlayers-1)*n4-n2], 1);
+	}else{
+		Copy(n4, t1, 1, &ab[(nlayers-1)*n4-n2], 1);
+	}
 	
 //	PrintMatrix("RHS0", n4,nlayers, ab, n4);
 	

@@ -1,3 +1,10 @@
+This checkout is s4-fieldalgo, a fork of victorliu/S4 1.1.  The import name is
+still S4 and existing scripts still run; see CHANGELOG-fieldalgo.md for what
+this line changed, and validation/UPSTREAM.md for the defects it fixes.
+Upstream's own README follows.
+
+----------------------------------------------------------------------
+
 S4: Stanford Stratified Structure Solver (http://fan.group.stanford.edu/S4/)
 
 A program for computing electromagnetic fields in periodic, layered

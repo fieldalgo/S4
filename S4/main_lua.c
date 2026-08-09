@@ -251,15 +251,29 @@ void HandleSolutionErrorCode(lua_State *L, const char *fname, int code){
 		"NumG was not set", /* 9 */
 		"A layer copy referenced an unknown layer", /* 10 */
 		"A layer copy referenced another layer copy", /* 11 */
-		"A duplicate layer name was found", /* 12 */
+		"Layer names must be unique: every lookup resolves to the first match, "
+			"so a repeated name leaves a layer that cannot be addressed", /* 12 */
 		"Excitation layer name not found", /* 13 */
 		"No layers exist in the structure", /* 14 */
 		"A material name was not found", /* 15 */
 		"Invalid patterning for 1D lattice", /* 16 */
+		"A layer has an invalid region; regions are numbered from 1 in the order "
+			"they were added to the layer", /* 17 */
+		"Regions must be either nested or disjoint; they are numbered from 1 in "
+			"the order they were added to the layer", /* 18 */
+		"A region may cross the unit cell boundary, but once the cell is tiled "
+			"the regions must not overlap; regions are numbered from 1 in the "
+			"order they were added to the layer", /* 19 */
+		"1D patterning has no containment tree, so the regions of a layer must "
+			"be disjoint intervals; a region sitting inside another has to be "
+			"written as the intervals on either side of it. Regions are numbered "
+			"from 1 in the order they were added to the layer", /* 20 */
+		"The lattice basis is degenerate, so the unit cell has no area and the "
+			"reciprocal lattice does not exist", /* 21 */
 		def
 	};
 	const char *str = def;
-	if(0 < code && code <= 16){
+	if(0 < code && code <= 21){
 		str = errstr[code];
 		S4L_error(L, "%s: %s.", fname, str);
 	}else{

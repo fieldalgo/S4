@@ -36,6 +36,24 @@
 #include <stdlib.h>
 #include "S4.h"
 #include "convert.h"
+
+/* This fork's version, and which source the binary was built from.  Both are
+ * set by gensetup.py.sh -- the first from the VERSION file, the second from the
+ * checkout -- and a build made outside a checkout says "unknown" rather than
+ * guessing.  They are joined with '+' as a local version identifier, so the
+ * human-meaningful number and the exact source are both readable at a glance.
+ *
+ * Upstream's release is kept separately.  It has not moved since 2018 and this
+ * line has, so reporting 1.1 would be a claim about behaviour that stopped
+ * being true. */
+#ifndef S4_FORK_VERSION
+# define S4_FORK_VERSION "0.0.0"
+#endif
+#ifndef S4_BUILD_ID
+# define S4_BUILD_ID "unknown"
+#endif
+#define S4_UPSTREAM "victorliu/S4 1.1 (7fd00a2)"
+#define S4_VERSION S4_FORK_VERSION "+" S4_BUILD_ID
 #include "SpectrumSampler.h"
 #include "cubature.h"
 #include "Interpolator.h"
@@ -109,7 +127,11 @@ static long GetPyInt(PyObject *obj){
 #endif
 }
 
+void HandleSolutionErrorCodeDetail(const char *fname, int code, const char *detail);
 void HandleSolutionErrorCode(const char *fname, int code){
+	HandleSolutionErrorCodeDetail(fname, code, NULL);
+}
+void HandleSolutionErrorCodeDetail(const char *fname, int code, const char *detail){
 	static const char def[] = "An unknown error occurred";
 	static const char* errstr[] = {
 		def, /* 0 */
@@ -124,20 +146,102 @@ void HandleSolutionErrorCode(const char *fname, int code){
 		"NumG was not set", /* 9 */
 		"A layer copy referenced an unknown layer", /* 10 */
 		"A layer copy referenced another layer copy", /* 11 */
-		"A duplicate layer name was found", /* 12 */
+		"Layer names must be unique: every lookup resolves to the first match, "
+			"so a repeated name leaves a layer that cannot be addressed", /* 12 */
 		"Excitation layer name not found", /* 13 */
 		"No layers exist in the structure", /* 14 */
 		"A material name was not found", /* 15 */
 		"Invalid patterning for 1D lattice", /* 16 */
+		"A layer has an invalid region; regions are numbered from 1 in the order "
+			"they were added to the layer", /* 17 */
+		"Regions must be either nested or disjoint; they are numbered from 1 in "
+			"the order they were added to the layer", /* 18 */
+		"A region may cross the unit cell boundary, but once the cell is tiled "
+			"the regions must not overlap; regions are numbered from 1 in the "
+			"order they were added to the layer", /* 19 */
+		"1D patterning has no containment tree, so the regions of a layer must "
+			"be disjoint intervals; a region sitting inside another has to be "
+			"written as the intervals on either side of it. Regions are numbered "
+			"from 1 in the order they were added to the layer", /* 20 */
+		"The lattice basis is degenerate, so the unit cell has no area and the "
+			"reciprocal lattice does not exist", /* 21 */
 		def
 	};
 	const char *str = def;
-	if(0 < code && code <= 16){
+	const int have = (NULL != detail && '\0' != detail[0]);
+	if(0 < code && code <= 21){
 		str = errstr[code];
-		PyErr_Format(PyExc_RuntimeError, "%s: %s", fname, str);
+		if(have){
+			PyErr_Format(PyExc_RuntimeError, "%s: %s. %s", fname, detail, str);
+		}else{
+			PyErr_Format(PyExc_RuntimeError, "%s: %s", fname, str);
+		}
+	}else if(have){
+		PyErr_Format(PyExc_RuntimeError, "%s: %s. %s, error code: %d",
+			fname, detail, str, code);
 	}else{
 		PyErr_Format(PyExc_RuntimeError, "%s: %s, error code: %d", fname, str, code);
 	}
+}
+
+/* Upstream commit cb47b74 ran a type rename over the Python keyword strings as
+ * well, so Layer= and Material= became S4_Layer= and S4_Material=.  Every script
+ * written against an earlier release stops working, with a TypeError that names
+ * the keyword the caller wrote and not the one now wanted -- and the two builds
+ * cannot be told apart from Python except by making a call and watching it fail.
+ *
+ * Both spellings are accepted.  A bare keyword is renamed in a copy of the
+ * keyword dict, so nothing the caller owns is modified, and the prefixed
+ * spelling wins if somehow both are given.  Returns a new reference, or NULL
+ * when there is nothing to rename.
+ */
+static const struct { const char *bare; const char *prefixed; } s4_kw_aliases[] = {
+	{ "Layer",    "S4_Layer"    },
+	{ "Material", "S4_Material" }
+};
+static PyObject *S4_RenameBareKeywords(PyObject *kwds){
+	PyObject *copy = NULL;
+	size_t i;
+	if(NULL == kwds || !PyDict_Check(kwds)){ return NULL; }
+	for(i = 0; i < sizeof(s4_kw_aliases)/sizeof(s4_kw_aliases[0]); ++i){
+		PyObject *v = PyDict_GetItemString(kwds, s4_kw_aliases[i].bare);
+		if(NULL == v){ continue; }
+		if(NULL != PyDict_GetItemString(kwds, s4_kw_aliases[i].prefixed)){ continue; }
+		if(NULL == copy){
+			copy = PyDict_Copy(kwds);
+			if(NULL == copy){ PyErr_Clear(); return NULL; }
+		}
+		/* v is borrowed from kwds, which outlives the parse; SetItem takes its
+		 * own reference anyway. */
+		if(0 != PyDict_SetItemString(copy, s4_kw_aliases[i].prefixed, v)
+		|| 0 != PyDict_DelItemString(copy, s4_kw_aliases[i].bare)){
+			/* Out of memory during a rename is not worth a distinct failure
+			 * mode: drop the copy and let the parse report the keyword the
+			 * caller actually wrote. */
+			PyErr_Clear();
+			Py_DECREF(copy);
+			return NULL;
+		}
+	}
+	return copy;
+}
+
+/* Drop-in for PyArg_ParseTupleAndKeywords that accepts both spellings.  The
+ * renamed dict is temporary, so it is released here rather than at every return
+ * path of every method; the values it holds belong to the caller's dict and
+ * outlive the call. */
+static int S4_ParseKeywords(PyObject *args, PyObject *kwds, const char *format,
+	char **kwlist, ...)
+{
+	va_list va;
+	int ok;
+	PyObject *renamed = S4_RenameBareKeywords(kwds);
+	va_start(va, kwlist);
+	ok = PyArg_VaParseTupleAndKeywords(args, NULL != renamed ? renamed : kwds,
+		format, kwlist, va);
+	va_end(va);
+	Py_XDECREF(renamed);
+	return ok;
 }
 
 #ifdef S4_DEBUG
@@ -175,7 +279,38 @@ static struct module_state _state;
 typedef struct{
 	PyObject_HEAD
 	S4_Simulation *S;
+	/* The core writes a sentence naming the layer, and sometimes the region,
+	 * through the message handler.  Nothing installed one, so those went
+	 * nowhere and the exception said only what kind of thing was wrong. */
+	char last_message[256];
+	/* NumBasis as the caller asked for it.  S->n_G is the count G_select
+	 * settled on, which is smaller and cannot be re-selected from. */
+	unsigned int n_basis_requested;
 } S4Sim;
+
+/* Keep the most recent message so the exception can carry it. */
+static int S4Sim_message_handler(void *data, const char *fname, int level,
+	const char *msg)
+{
+	S4Sim *self = (S4Sim*)data;
+	if(NULL != self && S4_MSG_ERROR == level && NULL != msg){
+		size_t n = strlen(msg);
+		if(n > sizeof(self->last_message)-1){
+			/* The solver already keeps names short enough that this should not
+			 * trigger, but a byte-wise cut through a multi-byte character would
+			 * reach PyErr_Format as ill-formed UTF-8, so step back off any
+			 * continuation bytes.  Duplicated from S4.cpp's S4_ElideName rather
+			 * than shared, because the only header both files include is the
+			 * public one and this does not belong in it. */
+			n = sizeof(self->last_message)-1;
+			while(n > 0 && 0x80 == (((unsigned char)msg[n]) & 0xC0)){ --n; }
+		}
+		memcpy(self->last_message, msg, n);
+		self->last_message[n] = '\0';
+	}
+	return 0;
+}
+
 
 typedef struct
 {
@@ -339,16 +474,23 @@ int excitation_converter(PyObject *obj, S4Excitation_Data *data)
 			PyErr_SetString(PyExc_TypeError, "the G index must be a integer.");
 			return 0;
 		}
-		data->exg[2 * i + 0] = PyInt_AsLong(pj);
+		data->exg[2 * i + 0] = PyLong_AsLong(pj);
 
 		//get polarization: 'x' or 'y'
 		pj = PyTuple_GetItem(pi, 1);
-		if(!PyString_Check(pj))
-		{
+		/* Python 2's PyString was the bytes/str type, and existing S4 scripts
+		   write the bare literal 'x'. Under Python 3 that literal is str, so
+		   accept str in addition to bytes. This only widens the accepted set:
+		   no input that used to be valid is rejected. */
+		if(PyUnicode_Check(pj)){
+			pol = (char*)PyUnicode_AsUTF8AndSize(pj, &polLen);
+			if(NULL == pol){ return 0; }
+		}else if(PyBytes_Check(pj)){
+			PyBytes_AsStringAndSize(pj, &pol, &polLen);
+		}else{
 			PyErr_SetString(PyExc_TypeError, "polalization should be specified by 'x' or 'y'.");
 			return 0;
 		}
-		PyString_AsStringAndSize(pj, &pol, &polLen);
 		if(1 != polLen || ('x' != pol[0] && 'y' != pol[0]))
 		{
 			PyErr_SetString(PyExc_TypeError, "polalization should be specified by 'x' or 'y'.");
@@ -532,10 +674,10 @@ static PyObject *S4Interpolator_new(PyTypeObject *type, PyObject *args, PyObject
 	const char *typeName;
 	S4Interpolator *self;
 	S4Interpolator_Data interData = {0, 0, NULL};
-	if(!PyArg_ParseTupleAndKeywords(args, kwds, "sO&:interpolator_new", kwlist, &typeName, &interpolator_table_converter, &interData))
+	if(!S4_ParseKeywords(args, kwds, "sO&:interpolator_new", kwlist, &typeName, &interpolator_table_converter, &interData))
 		return NULL;
 	interData.xy = (double*)malloc(sizeof(double) * interData.n * (interData.ny + 1));
-	if(!PyArg_ParseTupleAndKeywords(args, kwds, "sO&:interpolator_new", kwlist, &typeName, &interpolator_table_converter, &interData))
+	if(!S4_ParseKeywords(args, kwds, "sO&:interpolator_new", kwlist, &typeName, &interpolator_table_converter, &interData))
 	{
 		free(interData.xy); interData.xy = NULL;
 		return NULL;
@@ -570,7 +712,7 @@ static PyObject *S4Interpolator_Get(S4Interpolator *self, PyObject *args, PyObje
 	double *ys;
 	int ny;
 	PyObject *ret;
-	if(!PyArg_ParseTupleAndKeywords(args, kwds, "d:Get", kwlist, &x))
+	if(!S4_ParseKeywords(args, kwds, "d:Get", kwlist, &x))
 		return NULL;
 	ys = Interpolator_Get(self->I, x, &ny);
 	if(NULL == ys)
@@ -589,7 +731,7 @@ static PyObject *S4SpectrumSampler_new(PyTypeObject *type, PyObject *args, PyObj
 	SpectrumSampler_Options options = {33, 0.001, 10, 1e-6, 0};
 	PyObject *py_expectBool = NULL;
 	S4SpectrumSampler *self;
-	if(!PyArg_ParseTupleAndKeywords(args, kwds, "dd|i|d|d|d|O!:SpectrumSampler_New", \
+	if(!S4_ParseKeywords(args, kwds, "dd|idddO!:SpectrumSampler_New", \
 		kwlist, &x0, &x1, &options.initial_num_points, &options.range_threshold,\
 		&options.max_bend, &options.min_dx, &PyBool_Type, &py_expectBool))
 		return NULL;
@@ -614,10 +756,13 @@ static PyObject *S4Sim_new(PyTypeObject *type, PyObject *args, PyObject *kwds){
 	Py_ssize_t nbasis;
 	static char *kwlist[] = { "Lattice", "NumBasis", NULL };
 
-	if(!PyArg_ParseTupleAndKeywords(args, kwds, "O&n:New", kwlist, &lattice_converter, &(Lr[0]), &nbasis)){ return NULL; }
+	if(!S4_ParseKeywords(args, kwds, "O&n:New", kwlist, &lattice_converter, &(Lr[0]), &nbasis)){ return NULL; }
 	self = (S4Sim*)type->tp_alloc(type, 0);
 	if(self != NULL){
 		self->S = S4_Simulation_New(Lr, nbasis, NULL);
+		self->n_basis_requested = (unsigned int)nbasis;
+		self->last_message[0] = '\0';
+		S4_Simulation_SetMessageHandler(self->S, &S4Sim_message_handler, self);
 	}
 
 	return (PyObject*)self;
@@ -666,35 +811,37 @@ static PyObject *S4Sim_SetMaterial(S4Sim *self, PyObject *args, PyObject *kwds){
 	static char *kwlist[] = { "Name", "Epsilon", NULL };
 	const char *name;
 	struct epsilon_converter_data epsdata;
-	S4_Material *M;
-	if(!PyArg_ParseTupleAndKeywords(args, kwds, "sO&:SetMaterial", kwlist, &name, &epsilon_converter, &epsdata)){ return NULL; }
+	S4_MaterialID M;
+	S4_real eps[10];
+	int type;
+	if(!S4_ParseKeywords(args, kwds, "sO&:SetMaterial", kwlist, &name, &epsilon_converter, &epsdata)){ return NULL; }
+	/* A material is an integer id now, and a negative id means "not found".
+	 * S4_Simulation_SetMaterial adds a new material when handed a negative id
+	 * and updates the existing one otherwise, so the lookup result is passed
+	 * straight through -- the same get-or-create idiom the Lua frontend uses
+	 * in S4L_Simulation_SetMaterial. */
 	M = S4_Simulation_GetMaterialByName(self->S, name);
-	if(NULL == M){
-		M = Simulation_AddMaterial(self->S);
-		if(NULL == M){
-			PyErr_Format(PyExc_MemoryError, "SetMaterial: There was a problem allocating the material named '%s'.", name);
-			return NULL;
-		}
-		if(0 == epsdata.type){
-			Material_Init(M, name, NULL);
-		}else{
-			Material_InitTensor(M, name, NULL);
-		}
-	}
 
 	if(0 == epsdata.type){
-		M->eps.s[0] = epsdata.eps[0];
-		M->eps.s[1] = epsdata.eps[1];
+		eps[0] = epsdata.eps[0];
+		eps[1] = epsdata.eps[1];
+		type = S4_MATERIAL_TYPE_SCALAR_COMPLEX;
 	}else{
 		/* [ a b c ]    [ a b   ]
 		 * [ d e f ] -> [ d e   ]
 		 * [ g h i ]    [     i ]
 		 */
-		M->eps.abcde[0] = epsdata.eps[ 0]; M->eps.abcde[1] = epsdata.eps[ 1];
-		M->eps.abcde[2] = epsdata.eps[ 2]; M->eps.abcde[3] = epsdata.eps[ 3];
-		M->eps.abcde[4] = epsdata.eps[ 6]; M->eps.abcde[5] = epsdata.eps[ 7];
-		M->eps.abcde[6] = epsdata.eps[ 8]; M->eps.abcde[7] = epsdata.eps[ 9];
-		M->eps.abcde[8] = epsdata.eps[16]; M->eps.abcde[9] = epsdata.eps[17];
+		eps[0] = epsdata.eps[ 0]; eps[1] = epsdata.eps[ 1];
+		eps[2] = epsdata.eps[ 2]; eps[3] = epsdata.eps[ 3];
+		eps[4] = epsdata.eps[ 6]; eps[5] = epsdata.eps[ 7];
+		eps[6] = epsdata.eps[ 8]; eps[7] = epsdata.eps[ 9];
+		eps[8] = epsdata.eps[16]; eps[9] = epsdata.eps[17];
+		type = S4_MATERIAL_TYPE_XYTENSOR_COMPLEX;
+	}
+	M = S4_Simulation_SetMaterial(self->S, M, name, type, eps);
+	if(M < 0){
+		PyErr_Format(PyExc_MemoryError, "SetMaterial: There was a problem allocating the material named '%s'.", name);
+		return NULL;
 	}
 
 	Py_RETURN_NONE;
@@ -707,18 +854,25 @@ static PyObject *S4Sim_AddMaterial(S4Sim *self, PyObject *args, PyObject *kwds)
 
 static PyObject *S4Sim_AddLayer(S4Sim *self, PyObject *args, PyObject *kwds){
 	static char *kwlist[] = { "Name", "Thickness", "S4_Material", NULL };
-	S4_Layer *layer;
+	S4_LayerID layer;
 	const char *name;
 	double thickness;
 	const char *matname;
-	if(!PyArg_ParseTupleAndKeywords(args, kwds, "sds:AddLayer", kwlist, &name, &thickness, &matname)){ return NULL; }
+	S4_MaterialID M;
+	if(!S4_ParseKeywords(args, kwds, "sds:AddLayer", kwlist, &name, &thickness, &matname)){ return NULL; }
 
-	layer = Simulation_AddLayer(self->S);
-	if(NULL == layer){
+	/* A layer stores a material id now, not a material name, so the name is
+	 * resolved here. Mirrors the Lua frontend's S4L_Simulation_AddLayer. */
+	M = S4_Simulation_GetMaterialByName(self->S, matname);
+	if(M < 0){
+		PyErr_Format(PyExc_RuntimeError, "AddLayer: Unknown material '%s'.", matname);
+		return NULL;
+	}
+	layer = S4_Simulation_SetLayer(self->S, -1, name, &thickness, -1, M);
+	if(layer < 0){
 		PyErr_Format(PyExc_MemoryError, "AddLayer: There was a problem allocating the layer named '%s'.", name);
 		return NULL;
 	}
-	Layer_Init(layer, name, thickness, matname, NULL);
 
 	Py_RETURN_NONE;
 }
@@ -729,7 +883,7 @@ static PyObject *S4Sim_SetLayer(S4Sim *self, PyObject *args, PyObject *kwds)
 	const char *name, *material = NULL;
 	double thickness;
 	S4_Layer *layer;
-	if(!PyArg_ParseTupleAndKeywords(args, kwds, "sd|s:SetLayer", kwlist, &name, &thickness, &material))
+	if(!S4_ParseKeywords(args, kwds, "sd|s:SetLayer", kwlist, &name, &thickness, &material))
 		return NULL;
 	layer = Simulation_GetLayerByName(self->S, name, NULL);
 	if(NULL == layer)
@@ -737,8 +891,16 @@ static PyObject *S4Sim_SetLayer(S4Sim *self, PyObject *args, PyObject *kwds)
 	else
 	{
 		layer->thickness = thickness;
-		if(NULL != material)
-			layer->material = strdup(material);
+		if(NULL != material){
+			/* layer->material is an S4_MaterialID now, not a strdup'd name.
+			 * Resolve it the way the Lua frontend does. */
+			S4_MaterialID M = S4_Simulation_GetMaterialByName(self->S, material);
+			if(M < 0){
+				PyErr_Format(PyExc_RuntimeError, "SetLayer: Unknown material '%s'.", material);
+				return NULL;
+			}
+			layer->material = M;
+		}
 		Simulation_RemoveLayerPatterns(self->S, layer);
 	}
 	Py_RETURN_NONE;
@@ -746,18 +908,25 @@ static PyObject *S4Sim_SetLayer(S4Sim *self, PyObject *args, PyObject *kwds)
 
 static PyObject *S4Sim_AddLayerCopy(S4Sim *self, PyObject *args, PyObject *kwds){
 	static char *kwlist[] = { "Name", "Thickness", "S4_Layer", NULL };
-	S4_Layer *layer;
+	S4_LayerID layer;
 	const char *name;
 	double thickness;
 	const char *layername;
-	if(!PyArg_ParseTupleAndKeywords(args, kwds, "sds:AddLayerCopy", kwlist, &name, &thickness, &layername)){ return NULL; }
+	S4_LayerID Lcopy;
+	if(!S4_ParseKeywords(args, kwds, "sds:AddLayerCopy", kwlist, &name, &thickness, &layername)){ return NULL; }
 
-	layer = Simulation_AddLayer(self->S);
-	if(NULL == layer){
+	/* Mirrors the Lua frontend's S4L_Simulation_AddLayerCopy: resolve the
+	 * copied layer to an id and pass it as the "copy" argument. */
+	Lcopy = S4_Simulation_GetLayerByName(self->S, layername);
+	if(Lcopy < 0){
+		PyErr_Format(PyExc_RuntimeError, "AddLayerCopy: Layer not found: '%s'.", layername);
+		return NULL;
+	}
+	layer = S4_Simulation_SetLayer(self->S, -1, name, &thickness, Lcopy, -1);
+	if(layer < 0){
 		PyErr_Format(PyExc_MemoryError, "AddLayerCopy: There was a problem allocating the layer named '%s'.", name);
 		return NULL;
 	}
-	Layer_Init(layer, name, thickness, NULL, layername);
 
 	Py_RETURN_NONE;
 }
@@ -766,7 +935,7 @@ static PyObject *S4Sim_SetLayerThickness(S4Sim *self, PyObject *args, PyObject *
 	S4_Layer *layer;
 	const char *name;
 	double thickness;
-	if(!PyArg_ParseTupleAndKeywords(args, kwds, "sd:SetLayerThickness", kwlist, &name, &thickness)){ return NULL; }
+	if(!S4_ParseKeywords(args, kwds, "sd:SetLayerThickness", kwlist, &name, &thickness)){ return NULL; }
 
 	layer = Simulation_GetLayerByName(self->S, name, NULL);
 	if(NULL == layer){
@@ -786,7 +955,7 @@ static PyObject *S4Sim_RemoveLayerRegions(S4Sim *self, PyObject *args, PyObject 
 	S4_Layer *layer;
 	const char *name;
 
-	if(!PyArg_ParseTupleAndKeywords(args, kwds, "s:RemoveLayerRegions", kwlist, &name)){ return NULL; }
+	if(!S4_ParseKeywords(args, kwds, "s:RemoveLayerRegions", kwlist, &name)){ return NULL; }
 
 	layer = Simulation_GetLayerByName(self->S, name, NULL);
 	if(NULL == layer){
@@ -807,13 +976,16 @@ static PyObject *S4Sim_SetRegionCircle(S4Sim *self, PyObject *args, PyObject *kw
 	double center[2], radius;
 	int ret;
 
-	if(!PyArg_ParseTupleAndKeywords(args, kwds, "ss(dd)d:SetRegionCircle", kwlist, &layername, &matname, &center[0], &center[1], &radius)){ return NULL; }
+	if(!S4_ParseKeywords(args, kwds, "ss(dd)d:SetRegionCircle", kwlist, &layername, &matname, &center[0], &center[1], &radius)){ return NULL; }
 	layer = Simulation_GetLayerByName(self->S, layername, NULL);
 	if(NULL == layer){
 		PyErr_Format(PyExc_RuntimeError, "SetRegionCircle: S4_Layer named '%s' not found.", layername);
 		return NULL;
 	}
-	if(NULL != layer->copy){
+	/* layer->copy is an S4_LayerID now. A non-copy layer stores -1, and id 0
+	   is a perfectly valid layer, so the old "!= NULL" test was true for
+	   every ordinary layer. This is the predicate S4_Layer_IsCopy uses. */
+	if(layer->copy >= 0){
 		PyErr_Format(PyExc_RuntimeError, "SetRegionCircle: Cannot pattern a layer copy.");
 		return NULL;
 	}
@@ -839,13 +1011,16 @@ static PyObject *S4Sim_SetRegionEllipse(S4Sim *self, PyObject *args, PyObject *k
 	double center[2], tilt, halfwidths[2];
 	int ret;
 
-	if(!PyArg_ParseTupleAndKeywords(args, kwds, "ss(dd)d(dd):SetRegionEllipse", kwlist, &layername, &matname, &center[0], &center[1], &tilt, &halfwidths[0], &halfwidths[1])){ return NULL; }
+	if(!S4_ParseKeywords(args, kwds, "ss(dd)d(dd):SetRegionEllipse", kwlist, &layername, &matname, &center[0], &center[1], &tilt, &halfwidths[0], &halfwidths[1])){ return NULL; }
 	layer = Simulation_GetLayerByName(self->S, layername, NULL);
 	if(NULL == layer){
 		PyErr_Format(PyExc_RuntimeError, "SetRegionEllipse: S4_Layer named '%s' not found.", layername);
 		return NULL;
 	}
-	if(NULL != layer->copy){
+	/* layer->copy is an S4_LayerID now. A non-copy layer stores -1, and id 0
+	   is a perfectly valid layer, so the old "!= NULL" test was true for
+	   every ordinary layer. This is the predicate S4_Layer_IsCopy uses. */
+	if(layer->copy >= 0){
 		PyErr_Format(PyExc_RuntimeError, "SetRegionEllipse: Cannot pattern a layer copy.");
 		return NULL;
 	}
@@ -871,13 +1046,16 @@ static PyObject *S4Sim_SetRegionRectangle(S4Sim *self, PyObject *args, PyObject 
 	double center[2], tilt, halfwidths[2];
 	int ret;
 
-	if(!PyArg_ParseTupleAndKeywords(args, kwds, "ss(dd)d(dd):SetRegionRectangle", kwlist, &layername, &matname, &center[0], &center[1], &tilt, &halfwidths[0], &halfwidths[1])){ return NULL; }
+	if(!S4_ParseKeywords(args, kwds, "ss(dd)d(dd):SetRegionRectangle", kwlist, &layername, &matname, &center[0], &center[1], &tilt, &halfwidths[0], &halfwidths[1])){ return NULL; }
 	layer = Simulation_GetLayerByName(self->S, layername, NULL);
 	if(NULL == layer){
 		PyErr_Format(PyExc_RuntimeError, "SetRegionRectangle: S4_Layer named '%s' not found.", layername);
 		return NULL;
 	}
-	if(NULL != layer->copy){
+	/* layer->copy is an S4_LayerID now. A non-copy layer stores -1, and id 0
+	   is a perfectly valid layer, so the old "!= NULL" test was true for
+	   every ordinary layer. This is the predicate S4_Layer_IsCopy uses. */
+	if(layer->copy >= 0){
 		PyErr_Format(PyExc_RuntimeError, "SetRegionRectangle: Cannot pattern a layer copy.");
 		return NULL;
 	}
@@ -904,13 +1082,16 @@ static PyObject *S4Sim_SetRegionPolygon(S4Sim *self, PyObject *args, PyObject *k
 	struct polygon_converter_data polydata;
 	int ret;
 
-	if(!PyArg_ParseTupleAndKeywords(args, kwds, "ss(dd)dO&:SetRegionPolygon", kwlist, &layername, &matname, &center[0], &center[1], &tilt, &polygon_converter, &polydata)){ return NULL; }
+	if(!S4_ParseKeywords(args, kwds, "ss(dd)dO&:SetRegionPolygon", kwlist, &layername, &matname, &center[0], &center[1], &tilt, &polygon_converter, &polydata)){ return NULL; }
 	layer = Simulation_GetLayerByName(self->S, layername, NULL);
 	if(NULL == layer){
 		PyErr_Format(PyExc_RuntimeError, "SetRegionPolygon: S4_Layer named '%s' not found.", layername);
 		return NULL;
 	}
-	if(NULL != layer->copy){
+	/* layer->copy is an S4_LayerID now. A non-copy layer stores -1, and id 0
+	   is a perfectly valid layer, so the old "!= NULL" test was true for
+	   every ordinary layer. This is the predicate S4_Layer_IsCopy uses. */
+	if(layer->copy >= 0){
 		PyErr_Format(PyExc_RuntimeError, "SetRegionPolygon: Cannot pattern a layer copy.");
 		return NULL;
 	}
@@ -935,23 +1116,23 @@ static PyObject *S4Sim_SetExcitationExterior(S4Sim *self, PyObject *args, PyObje
 	int err;
 	/*double calls to one function with some flag to get size info,
 	so heap location variable can be initialized. learn from WIN32 API :) */
-	if(!PyArg_ParseTupleAndKeywords(args, kwds, "O&:S4Sim_SetExcitationExterior", kwlist, &excitation_converter, &exciData))
+	if(!S4_ParseKeywords(args, kwds, "O&:S4Sim_SetExcitationExterior", kwlist, &excitation_converter, &exciData))
 		return NULL;
 	exciData.exg = (int*)malloc(sizeof(int) * 2 * exciData.n);
 	exciData.ex = (double*)malloc(sizeof(double)* 2 * exciData.n);
-	if(!PyArg_ParseTupleAndKeywords(args, kwds, "O&:S4Sim_SetExcitationExterior", kwlist, &excitation_converter, &exciData))
+	if(!S4_ParseKeywords(args, kwds, "O&:S4Sim_SetExcitationExterior", kwlist, &excitation_converter, &exciData))
 	{
 		free(exciData.exg); exciData.exg = NULL;
 		free(exciData.ex); exciData.ex = NULL;
 		return NULL;
 	}
 
-	err = Simulation_MakeExcitationExterior(self->S, exciData.n, exciData.exg, exciData.ex);
+	err = S4_Simulation_ExcitationExterior(self->S, exciData.n, exciData.exg, exciData.ex);
 	free(exciData.exg); exciData.exg = NULL;
 	free(exciData.ex); exciData.ex = NULL;
 	if(0 != err)
 	{
-		HandleSolutionErrorCode("S4Sim_SetExcitationExterior", err);
+		HandleSolutionErrorCodeDetail("S4Sim_SetExcitationExterior", err, self->last_message);
 		return NULL;
 	}
 	Py_RETURN_NONE;
@@ -966,7 +1147,7 @@ static PyObject *S4Sim_SetExcitationPlanewave(S4Sim *self, PyObject *args, PyObj
 	Py_ssize_t order = 0;
 	cs.real = 0; cs.imag = 0;
 	cp.real = 0; cp.imag = 0;
-	if(!PyArg_ParseTupleAndKeywords(args, kwds, "(dd)|DDn:SetExcitationPlanewave", kwlist, &angle[0], &angle[1], &cs, &cp, &order)){ return NULL; }
+	if(!S4_ParseKeywords(args, kwds, "(dd)|DDn:SetExcitationPlanewave", kwlist, &angle[0], &angle[1], &cs, &cp, &order)){ return NULL; }
 
 	pol_s[0] = sqrt(cs.real*cs.real + cs.imag*cs.imag); pol_s[1] = atan2(cs.imag,cs.real);
 	pol_p[0] = sqrt(cp.real*cp.real + cp.imag*cp.imag); pol_p[1] = atan2(cp.imag,cp.real);
@@ -974,7 +1155,7 @@ static PyObject *S4Sim_SetExcitationPlanewave(S4Sim *self, PyObject *args, PyObj
 	angle[1] *= (M_PI/180.);
 	ret = Simulation_MakeExcitationPlanewave(self->S, angle, pol_s, pol_p, order);
 	if(0 != ret){
-		HandleSolutionErrorCode("SetExcitationPlanewave", ret);
+		HandleSolutionErrorCodeDetail("SetExcitationPlanewave", ret, self->last_message);
 		return NULL;
 	}
 	Py_RETURN_NONE;
@@ -1014,7 +1195,8 @@ static PyObject *S4Sim_GetEpsilon(S4Sim *self, PyObject *args){
 	if(!PyArg_ParseTuple(args, "ddd:GetEpsilon", &r[0], &r[1], &r[2])){ return NULL; }
 	ret = Simulation_GetEpsilon(self->S, r, feps);
 	if(0 != ret){
-		HandleSolutionErrorCode("GetEpsilon", ret);
+		HandleSolutionErrorCodeDetail("GetEpsilon", ret, self->last_message);
+		return NULL;
 	}
 	return PyComplex_FromDoubles(feps[0], feps[1]);
 }
@@ -1029,7 +1211,7 @@ static PyObject *S4Sim_OutputLayerPatternRealization(S4Sim *self, PyObject *args
 	FILE *fp;
 	int err;
 
-	if(!PyArg_ParseTupleAndKeywords(args, kwds, "sii|s:OutputLayerPatternRealization", kwlist, &layerName, &Nu, &Nv, &fileName))
+	if(!S4_ParseKeywords(args, kwds, "sii|s:OutputLayerPatternRealization", kwlist, &layerName, &Nu, &Nv, &fileName))
 		return NULL;
 
 	layer = Simulation_GetLayerByName(self->S, layerName, NULL);
@@ -1051,7 +1233,7 @@ static PyObject *S4Sim_OutputLayerPatternRealization(S4Sim *self, PyObject *args
 	err = Simulation_OutputLayerPatternRealization(self->S, layer, Nu, Nv, fp);
 	if(0 != err)
 	{
-		HandleSolutionErrorCode("OutputLayerPatternRealization", err);
+		HandleSolutionErrorCodeDetail("OutputLayerPatternRealization", err, self->last_message);
 		return NULL;
 	}
 	if(NULL != fp)
@@ -1067,7 +1249,7 @@ static PyObject *S4Sim_OutputLayerPatternPostscript(S4Sim *self, PyObject *args,
 	const char *filename = NULL;
 	S4_Layer *layer;
 
-	if(!PyArg_ParseTupleAndKeywords(args, kwds, "s|s:OutputLayerPatternPostscript", kwlist, &layername, &filename)){ return NULL; }
+	if(!S4_ParseKeywords(args, kwds, "s|s:OutputLayerPatternPostscript", kwlist, &layername, &filename)){ return NULL; }
 
 	layer = Simulation_GetLayerByName(self->S, layername, NULL);
 	if(NULL == layer){
@@ -1082,7 +1264,7 @@ static PyObject *S4Sim_OutputLayerPatternPostscript(S4Sim *self, PyObject *args,
 
 		ret = Simulation_OutputLayerPatternDescription(self->S, layer, fp);
 		if(0 != ret){
-			HandleSolutionErrorCode("OutputLayerPatternDescription", ret);
+			HandleSolutionErrorCodeDetail("OutputLayerPatternDescription", ret, self->last_message);
 			return NULL;
 		}
 
@@ -1098,7 +1280,7 @@ static PyObject *S4Sim_OutputStructurePOVRay(S4Sim *self, PyObject *args, PyObje
 	static char *kwlist[] = { "Filename", NULL };
 	const char *filename = NULL;
 
-	if(!PyArg_ParseTupleAndKeywords(args, kwds, "|s:OutputStructurePOVRay", kwlist, &filename)){ return NULL; }
+	if(!S4_ParseKeywords(args, kwds, "|s:OutputStructurePOVRay", kwlist, &filename)){ return NULL; }
 
 	{
 		FILE *fp = stdout;
@@ -1108,7 +1290,7 @@ static PyObject *S4Sim_OutputStructurePOVRay(S4Sim *self, PyObject *args, PyObje
 
 		ret = Simulation_OutputStructurePOVRay(self->S, fp);
 		if(0 != ret){
-			HandleSolutionErrorCode("OutputStructurePOVRay", ret);
+			HandleSolutionErrorCodeDetail("OutputStructurePOVRay", ret, self->last_message);
 			return NULL;
 		}
 
@@ -1126,13 +1308,13 @@ static PyObject *S4Sim_GetBasisSet(S4Sim *self, PyObject *args){
 
 	ret = Simulation_InitSolution(self->S);
 	if(0 != ret){
-		HandleSolutionErrorCode("GetBasisSet", ret);
+		HandleSolutionErrorCodeDetail("GetBasisSet", ret, self->last_message);
 		return NULL;
 	}
 
 	n = Simulation_GetNumG(self->S, &G);
 	if(NULL == G){
-		HandleSolutionErrorCode("GetBasisSet", 0);
+		HandleSolutionErrorCodeDetail("GetBasisSet", 0, self->last_message);
 		return NULL;
 	}
 	rv = PyTuple_New(n);
@@ -1157,7 +1339,7 @@ static PyObject *S4Sim_GetAmplitudes(S4Sim *self, PyObject *args, PyObject *kwds
 	S4_Layer *layer;
 	PyObject *rv, *rventry;
 
-	if(!PyArg_ParseTupleAndKeywords(args, kwds, "s|d:GetAmplitudes", kwlist, &layername, &offset)){ return NULL; }
+	if(!S4_ParseKeywords(args, kwds, "s|d:GetAmplitudes", kwlist, &layername, &offset)){ return NULL; }
 
 	layer = Simulation_GetLayerByName(self->S, layername, NULL);
 	if(NULL == layer){
@@ -1168,7 +1350,7 @@ static PyObject *S4Sim_GetAmplitudes(S4Sim *self, PyObject *args, PyObject *kwds
 	amp = (double*)malloc(sizeof(double)*8*n);
 	ret = Simulation_GetAmplitudes(self->S, layer, offset, amp, &amp[4*n]);
 	if(0 != ret){
-		HandleSolutionErrorCode("GetAmplitudes", ret);
+		HandleSolutionErrorCodeDetail("GetAmplitudes", ret, self->last_message);
 		return NULL;
 	}
 
@@ -1185,24 +1367,71 @@ static PyObject *S4Sim_GetAmplitudes(S4Sim *self, PyObject *args, PyObject *kwds
 	free(amp);
 	return rv;
 }
+/* Read the options back.
+ *
+ * SetOptions is write-only, so there is no way to confirm that an option was
+ * understood -- which is how LatticeTruncation being silently ignored survived
+ * as long as it did.  The keys are the ones SetOptions accepts, so a caller can
+ * feed the result of one straight back into the other.
+ *
+ * NumBasis is reported alongside them because it is the option the caller
+ * cannot otherwise check: the basis is chosen once, from the truncation in
+ * force at the time, and the count that comes out is smaller than the count
+ * that was asked for.  Seeing both is what makes a wrong truncation visible.
+ */
+static PyObject *S4Sim_GetOptions(S4Sim *self, PyObject *Py_UNUSED(ignored)){
+	const S4_Options *o = &self->S->options;
+	const char *truncation = (1 == o->lattice_truncation)
+		? "Parallelogramic" : "Circular";
+	const char *basis = "Default";
+	PyObject *lanczos;
+	if(o->use_jones_vector_basis){ basis = "Jones"; }
+	else if(o->use_normal_vector_basis){ basis = "Normal"; }
+
+	if(o->use_Lanczos_smoothing){
+		lanczos = Py_BuildValue("{s:d,s:i}",
+			"Width", (double)o->lanczos_smoothing_width,
+			"Power", o->lanczos_smoothing_power);
+	}else{
+		lanczos = PyBool_FromLong(0);
+	}
+	if(NULL == lanczos){ return NULL; }
+
+	return Py_BuildValue(
+		"{s:i,s:s,s:O,s:i,s:O,s:s,s:N,s:O,s:O,s:i,s:i}",
+		"Verbosity",                 o->verbosity,
+		"LatticeTruncation",         truncation,
+		"DiscretizedEpsilon",        o->use_discretized_epsilon ? Py_True : Py_False,
+		"DiscretizationResolution",  o->resolution,
+		"PolarizationDecomposition", o->use_polarization_basis ? Py_True : Py_False,
+		"PolarizationBasis",         basis,
+		"LanczosSmoothing",          lanczos,
+		"SubpixelSmoothing",         o->use_subpixel_smoothing ? Py_True : Py_False,
+		"ConserveMemory",            o->use_less_memory ? Py_True : Py_False,
+		"NumBasis",                  self->S->n_G,
+		"NumBasisRequested",         (int)self->n_basis_requested);
+}
+
 static PyObject *S4Sim_GetPowerFlux(S4Sim *self, PyObject *args, PyObject *kwds){
 	int ret;
 	static char *kwlist[] = { "S4_Layer", "zOffset", NULL };
 	const char *layername;
 	double offset = 0;
 	double power[4];
-	S4_Layer *layer;
+	S4_LayerID layer;
 
-	if(!PyArg_ParseTupleAndKeywords(args, kwds, "s|d:GetPowerFlux", kwlist, &layername, &offset)){ return NULL; }
+	if(!S4_ParseKeywords(args, kwds, "s|d:GetPowerFlux", kwlist, &layername, &offset)){ return NULL; }
 
-	layer = Simulation_GetLayerByName(self->S, layername, NULL);
-	if(NULL == layer){
+	/* Layers are integer ids now and the offset is passed by pointer.
+	 * Mirrors the Lua frontend's S4L_Simulation_GetPoyntingFlux. */
+	layer = S4_Simulation_GetLayerByName(self->S, layername);
+	if(layer < 0){
 		PyErr_Format(PyExc_RuntimeError, "GetPowerFlux: S4_Layer named '%s' not found.", layername);
 		return NULL;
 	}
-	ret = Simulation_GetPoyntingFlux(self->S, layer, offset, power);
+	ret = S4_Simulation_GetPowerFlux(self->S, layer, &offset, power);
 	if(0 != ret){
-		HandleSolutionErrorCode("GetPowerFlux", ret);
+		HandleSolutionErrorCodeDetail("GetPowerFlux", ret, self->last_message);
 		return NULL;
 	}
 
@@ -1221,7 +1450,7 @@ static PyObject *S4Sim_GetPowerFluxByOrder(S4Sim *self, PyObject *args, PyObject
 	S4_Layer *layer;
 	PyObject *rv;
 
-	if(!PyArg_ParseTupleAndKeywords(args, kwds, "s|d:GetPowerFluxByOrder", kwlist, &layername, &offset)){ return NULL; }
+	if(!S4_ParseKeywords(args, kwds, "s|d:GetPowerFluxByOrder", kwlist, &layername, &offset)){ return NULL; }
 
 	layer = Simulation_GetLayerByName(self->S, layername, NULL);
 	if(NULL == layer){
@@ -1232,7 +1461,7 @@ static PyObject *S4Sim_GetPowerFluxByOrder(S4Sim *self, PyObject *args, PyObject
 	power = (double*)malloc(sizeof(double)*4*n);
 	ret = Simulation_GetPoyntingFluxByG(self->S, layer, offset, power);
 	if(0 != ret){
-		HandleSolutionErrorCode("GetPowerFluxByOrder", ret);
+		HandleSolutionErrorCodeDetail("GetPowerFluxByOrder", ret, self->last_message);
 		return NULL;
 	}
 
@@ -1256,7 +1485,7 @@ static PyObject *S4Sim_GetStressTensorIntegral(S4Sim *self, PyObject *args, PyOb
 	double Tint[6];
 	S4_Layer *layer;
 
-	if(!PyArg_ParseTupleAndKeywords(args, kwds, "s|d:GetStressTensorIntegral", kwlist, &layername, &offset)){ return NULL; }
+	if(!S4_ParseKeywords(args, kwds, "s|d:GetStressTensorIntegral", kwlist, &layername, &offset)){ return NULL; }
 
 	layer = Simulation_GetLayerByName(self->S, layername, NULL);
 	if(NULL == layer){
@@ -1265,7 +1494,7 @@ static PyObject *S4Sim_GetStressTensorIntegral(S4Sim *self, PyObject *args, PyOb
 	}
 	ret = Simulation_GetStressTensorIntegral(self->S, layer, offset, Tint);
 	if(0 != ret){
-		HandleSolutionErrorCode("GetStressTensorIntegral", ret);
+		HandleSolutionErrorCodeDetail("GetStressTensorIntegral", ret, self->last_message);
 		return NULL;
 	}
 
@@ -1285,7 +1514,7 @@ static PyObject *S4Sim_GetLayerVolumeIntegral(S4Sim *self, PyObject *args, PyObj
 	char which = 'U';
 	S4_Layer *layer;
 
-	if(!PyArg_ParseTupleAndKeywords(args, kwds, "ss:GetLayerVolumeIntegral", kwlist, &layername, &strwhat)){ return NULL; }
+	if(!S4_ParseKeywords(args, kwds, "ss:GetLayerVolumeIntegral", kwlist, &layername, &strwhat)){ return NULL; }
 
 	layer = Simulation_GetLayerByName(self->S, layername, NULL);
 	if(NULL == layer){
@@ -1308,7 +1537,7 @@ static PyObject *S4Sim_GetLayerVolumeIntegral(S4Sim *self, PyObject *args, PyObj
 
 	ret = Simulation_GetLayerVolumeIntegral(self->S, layer, which, integral);
 	if(0 != ret){
-		HandleSolutionErrorCode("GetLayerVolumeIntegral", ret);
+		HandleSolutionErrorCodeDetail("GetLayerVolumeIntegral", ret, self->last_message);
 		return NULL;
 	}
 
@@ -1321,7 +1550,7 @@ static PyObject *S4Sim_GetLayerZIntegral(S4Sim *self, PyObject *args, PyObject *
 	double integral[6], r[2];
 	S4_Layer *layer;
 
-	if(!PyArg_ParseTupleAndKeywords(args, kwds, "s(dd):GetLayerZIntegral", kwlist, &layername, &r[0], &r[1])){ return NULL; }
+	if(!S4_ParseKeywords(args, kwds, "s(dd):GetLayerZIntegral", kwlist, &layername, &r[0], &r[1])){ return NULL; }
 
 	layer = Simulation_GetLayerByName(self->S, layername, NULL);
 	if(NULL == layer){
@@ -1331,7 +1560,7 @@ static PyObject *S4Sim_GetLayerZIntegral(S4Sim *self, PyObject *args, PyObject *
 
 	ret = Simulation_GetLayerZIntegral(self->S, layer, r, integral);
 	if(0 != ret){
-		HandleSolutionErrorCode("GetLayerZIntegral", ret);
+		HandleSolutionErrorCodeDetail("GetLayerZIntegral", ret, self->last_message);
 		return NULL;
 	}
 	return PyTuple_Pack(2,
@@ -1354,7 +1583,7 @@ static PyObject *S4Sim_GetFields(S4Sim *self, PyObject *args, PyObject *kwds){
 
 	ret = Simulation_GetField(self->S, r, fE, fH);
 	if(0 != ret){
-		HandleSolutionErrorCode("GetFields", ret);
+		HandleSolutionErrorCodeDetail("GetFields", ret, self->last_message);
 		return NULL;
 	}
 	return PyTuple_Pack(2,
@@ -1384,7 +1613,7 @@ static PyObject *S4Sim_GetFieldsOnGrid(S4Sim *self, PyObject *args, PyObject *kw
 	FILE *fp;
 	int snxy[2];
 
-	if(!PyArg_ParseTupleAndKeywords(args, kwds, "d(nn)s|s:GetFieldsOnGrid", kwlist, &z, &nxy[0], &nxy[1], &fmt, &fbasename)){ return NULL; }
+	if(!S4_ParseKeywords(args, kwds, "d(nn)s|s:GetFieldsOnGrid", kwlist, &z, &nxy[0], &nxy[1], &fmt, &fbasename)){ return NULL; }
 	len = strlen(fbasename);
 
 	filename = (char*)malloc(sizeof(char) * (len+3));
@@ -1399,7 +1628,7 @@ static PyObject *S4Sim_GetFieldsOnGrid(S4Sim *self, PyObject *args, PyObject *kw
 	snxy[1] = nxy[1];
 	ret = Simulation_GetFieldPlane(self->S, snxy, z, Efields, Hfields);
 	if(0 != ret){
-		HandleSolutionErrorCode("GetFieldsOnGrid", ret);
+		HandleSolutionErrorCodeDetail("GetFieldsOnGrid", ret, self->last_message);
 		return NULL;
 	}
 
@@ -1525,7 +1754,7 @@ static PyObject *S4Sim_GetSMatrixDeterminant(S4Sim *self, PyObject *args){
 
 	ret = Simulation_GetSMatrixDeterminant(self->S, mant, &base, &expo);
 	if(0 != ret){
-		HandleSolutionErrorCode("GetSMatrixDeterminant", ret);
+		HandleSolutionErrorCodeDetail("GetSMatrixDeterminant", ret, self->last_message);
 		return NULL;
 	}
 	return PyTuple_Pack(3,
@@ -1539,8 +1768,9 @@ static PyObject *S4Sim_SetVerbosity(S4Sim *self, PyObject *args, PyObject *kwds)
 {
 	static char *kwlist[] = {"Level", NULL};
 	int level;
-	if(PyArg_ParseTupleAndKeywords(args, kwds, "i:SetVerbosity", kwlist, &level))
+	if(!S4_ParseKeywords(args, kwds, "i:SetVerbosity", kwlist, &level)){
 		return NULL;
+	}
 
 	if(level < 0 || level > 9)
 	{
@@ -1577,7 +1807,7 @@ static PyObject *S4Sim_SetOptions(S4Sim *self, PyObject *args, PyObject *kwds){
 	const char *lattice_truncation = NULL;
 	const char *polarization_basis = NULL;
 
-	if(!PyArg_ParseTupleAndKeywords(
+	if(!S4_ParseKeywords(
 		args, kwds, "|isO&iO&sO&O&O&:SetOptions", kwlist,
 		&verbosity,
 		&lattice_truncation,
@@ -1594,6 +1824,7 @@ static PyObject *S4Sim_SetOptions(S4Sim *self, PyObject *args, PyObject *kwds){
 		self->S->options.verbosity = verbosity;
 	}
 	if(NULL != lattice_truncation){
+		const int was = self->S->options.lattice_truncation;
 		if(0 == strcmp("Circular", lattice_truncation)){
 			self->S->options.lattice_truncation = 0;
 		}else if(0 == strcmp("Parallelogramic", lattice_truncation)){
@@ -1601,6 +1832,16 @@ static PyObject *S4Sim_SetOptions(S4Sim *self, PyObject *args, PyObject *kwds){
 		}else{
 			PyErr_SetString(PyExc_ValueError, "LatticeTruncation must be one of: 'Circular', 'Parallelogramic'");
 			return NULL;
+		}
+		if(was != self->S->options.lattice_truncation){
+			/* The G vectors were chosen inside S4_Simulation_New, before this
+			 * option could be given, so setting it here changes nothing unless
+			 * the selection is run again.  Simulation_SetNumG re-selects with
+			 * the truncation now in force; it has to be handed the count the
+			 * caller originally asked for, because S->n_G has already been
+			 * reduced to whatever the first selection settled on and starting
+			 * from that would shrink the basis a second time. */
+			Simulation_SetNumG(self->S, (int)self->n_basis_requested);
 		}
 	}
 	if(discretized_epsilon >= 0){
@@ -1702,7 +1943,7 @@ static PyObject *S4SpectrumSampler_SubmitResult(S4SpectrumSampler *self, PyObjec
 {
 	static char *kwlist[] = {"Result", NULL};
 	double y;
-	if(!PyArg_ParseTupleAndKeywords(args, kwds, "d:SubmitResult", kwlist, &y))
+	if(!S4_ParseKeywords(args, kwds, "d:SubmitResult", kwlist, &y))
 		return NULL;
 	if(SpectrumSampler_IsParallelized(self->SpecS))
 	{
@@ -1719,7 +1960,7 @@ static PyObject *S4SpectrumSampler_SubmitResults(S4SpectrumSampler *self, PyObje
 	int ny;
 	double *y;
 	PyObject *tupleObj = NULL;
-	if(!PyArg_ParseTupleAndKeywords(args, kwds, "O!:SubmitResults", kwlist, &PyTuple_Type, &tupleObj))
+	if(!S4_ParseKeywords(args, kwds, "O!:SubmitResults", kwlist, &PyTuple_Type, &tupleObj))
 		return NULL;
 	if(!SpectrumSampler_IsParallelized(self->SpecS))
 	{
@@ -1777,50 +2018,51 @@ static PyMethodDef	S4Interpolator_methods[] =
 };
 
 static PyMethodDef S4Sim_methods[] = {
-	{"Clone"            , (PyCFunction)S4Sim_Clone, METH_NOARGS, PyDoc_STR("Clone() -> S4.S4_Simulation")},
+	{"Clone"            , (PyCFunction)S4Sim_Clone, METH_NOARGS, PyDoc_STR("Clone() -> Simulation.  Independent deep copy; editing one does not affect the other")},
 	/* Specification */
-	{"AddMaterial"				, (PyCFunction)S4Sim_AddMaterial, METH_VARARGS | METH_KEYWORDS, PyDoc_STR("AddMaterial(name,eps) -> None")},
-	{"SetMaterial"				, (PyCFunction)S4Sim_SetMaterial, METH_VARARGS | METH_KEYWORDS, PyDoc_STR("SetMaterial(name,eps) -> None")},
-	{"AddLayer"					, (PyCFunction)S4Sim_AddLayer, METH_VARARGS | METH_KEYWORDS, PyDoc_STR("AddLayer(name,thickness,matname) -> None")},
-	{"AddLayerCopy"				, (PyCFunction)S4Sim_AddLayerCopy, METH_VARARGS | METH_KEYWORDS, PyDoc_STR("AddLayerCopy(name,thickness,layer) -> None")},
-	{"SetLayer"					, (PyCFunction)S4Sim_SetLayer, METH_VARARGS | METH_KEYWORDS, PyDoc_STR("SetLayer(name,thickness,material) -> None")},
-	{"SetLayerThickness"		, (PyCFunction)S4Sim_SetLayerThickness, METH_VARARGS | METH_KEYWORDS, PyDoc_STR("SetLayerThickness(layer,thickness) -> None")},
-	{"SetVerbosity"				, (PyCFunction)S4Sim_SetVerbosity, METH_VARARGS | METH_KEYWORDS, PyDoc_STR("SetVerbosity(level) -> None")},
-	{"RemoveLayerRegions"		, (PyCFunction)S4Sim_RemoveLayerRegions, METH_VARARGS | METH_KEYWORDS, PyDoc_STR("RemoveLayerPatterns(layer) -> None")},
-	{"SetRegionCircle"			, (PyCFunction)S4Sim_SetRegionCircle, METH_VARARGS | METH_KEYWORDS, PyDoc_STR("SetLayerPatternCircle(layer,matname,center,radius) -> None")},
-	{"SetRegionEllipse"			, (PyCFunction)S4Sim_SetRegionEllipse, METH_VARARGS | METH_KEYWORDS, PyDoc_STR("SetLayerPatternEllipse(layer,matname,center,angle,halfwidths) -> None")},
-	{"SetRegionRectangle"		, (PyCFunction)S4Sim_SetRegionRectangle, METH_VARARGS | METH_KEYWORDS, PyDoc_STR("SetLayerPatternRectangle(layer,matname,center,angle,halfwidths) -> None")},
-	{"SetRegionPolygon"			, (PyCFunction)S4Sim_SetRegionPolygon, METH_VARARGS | METH_KEYWORDS, PyDoc_STR("SetLayerPatternPolygon(layer,matname,center,angle,vertices) -> None")},
-	{"SetExcitationPlanewave"	, (PyCFunction)S4Sim_SetExcitationPlanewave, METH_VARARGS | METH_KEYWORDS, PyDoc_STR("SetExcitationPlanewave(angles,s_amp,p_amp) -> None")},
-	{"SetExcitationExterior"	, (PyCFunction)S4Sim_SetExcitationExterior, METH_VARARGS | METH_KEYWORDS, PyDoc_STR("SetExcitationExterior(Excitations) -> None")},
-	{"SetFrequency"				, (PyCFunction)S4Sim_SetFrequency, METH_VARARGS, PyDoc_STR("SetFrequency(freq) -> None")},
+	{"AddMaterial"				, (PyCFunction)S4Sim_AddMaterial, METH_VARARGS | METH_KEYWORDS, PyDoc_STR("AddMaterial(Name=, Epsilon=) -> None.  Epsilon is a number, or a 3x3 tuple of numbers for a tensor")},
+	{"SetMaterial"				, (PyCFunction)S4Sim_SetMaterial, METH_VARARGS | METH_KEYWORDS, PyDoc_STR("SetMaterial(Name=, Epsilon=) -> None.  Adds the material, or redefines it if the name exists")},
+	{"AddLayer"					, (PyCFunction)S4Sim_AddLayer, METH_VARARGS | METH_KEYWORDS, PyDoc_STR("AddLayer(Name=, Thickness=, Material=) -> None.  Appends a layer; the name must be new")},
+	{"AddLayerCopy"				, (PyCFunction)S4Sim_AddLayerCopy, METH_VARARGS | METH_KEYWORDS, PyDoc_STR("AddLayerCopy(Name=, Thickness=, Layer=) -> None.  A layer sharing another's patterning")},
+	{"SetLayer"					, (PyCFunction)S4Sim_SetLayer, METH_VARARGS | METH_KEYWORDS, PyDoc_STR("SetLayer(Name=, Thickness=, Material=) -> None.  Redefines a layer, or adds it if the name is new")},
+	{"SetLayerThickness"		, (PyCFunction)S4Sim_SetLayerThickness, METH_VARARGS | METH_KEYWORDS, PyDoc_STR("SetLayerThickness(Layer=, Thickness=) -> None")},
+	{"SetVerbosity"				, (PyCFunction)S4Sim_SetVerbosity, METH_VARARGS | METH_KEYWORDS, PyDoc_STR("SetVerbosity(Level=) -> None.  0 to 9; higher prints more of the solve to stdout")},
+	{"RemoveLayerRegions"		, (PyCFunction)S4Sim_RemoveLayerRegions, METH_VARARGS | METH_KEYWORDS, PyDoc_STR("RemoveLayerRegions(Layer=) -> None.  Drops every region, leaving the layer's background")},
+	{"SetRegionCircle"			, (PyCFunction)S4Sim_SetRegionCircle, METH_VARARGS | METH_KEYWORDS, PyDoc_STR("SetRegionCircle(Layer=, Material=, Center=, Radius=) -> None")},
+	{"SetRegionEllipse"			, (PyCFunction)S4Sim_SetRegionEllipse, METH_VARARGS | METH_KEYWORDS, PyDoc_STR("SetRegionEllipse(Layer=, Material=, Center=, Angle=, Halfwidths=) -> None.  Angle in degrees")},
+	{"SetRegionRectangle"		, (PyCFunction)S4Sim_SetRegionRectangle, METH_VARARGS | METH_KEYWORDS, PyDoc_STR("SetRegionRectangle(Layer=, Material=, Center=, Angle=, Halfwidths=) -> None.  Angle in degrees")},
+	{"SetRegionPolygon"			, (PyCFunction)S4Sim_SetRegionPolygon, METH_VARARGS | METH_KEYWORDS, PyDoc_STR("SetRegionPolygon(Layer=, Material=, Center=, Angle=, Vertices=) -> None.  Vertices is a tuple of (x,y) pairs relative to Center")},
+	{"SetExcitationPlanewave"	, (PyCFunction)S4Sim_SetExcitationPlanewave, METH_VARARGS | METH_KEYWORDS, PyDoc_STR("SetExcitationPlanewave(IncidenceAngles=, sAmplitude=, pAmplitude=, Order=) -> None.  Angles (theta,phi) in degrees")},
+	{"SetExcitationExterior"	, (PyCFunction)S4Sim_SetExcitationExterior, METH_VARARGS | METH_KEYWORDS, PyDoc_STR("SetExcitationExterior(Excitations=) -> None.  Tuple of (order, b'x'|b'y', amplitude)")},
+	{"SetFrequency"				, (PyCFunction)S4Sim_SetFrequency, METH_VARARGS, PyDoc_STR("SetFrequency(freq) -> None.  One number; complex for a lossy sweep.  Frequency, not wavelength")},
 	/* Outputs requiring no solutions */
 	{"GetReciprocalLattice"		, (PyCFunction)S4Sim_GetReciprocalLattice, METH_NOARGS, PyDoc_STR("GetReciprocalLattice() -> ((px,py),(qx,qy))")},
-	{"GetEpsilon"				, (PyCFunction)S4Sim_GetEpsilon, METH_VARARGS, PyDoc_STR("GetEpsilon(x,y,z) -> Complex")},
-	{"OutputLayerPatternPostscript", (PyCFunction)S4Sim_OutputLayerPatternPostscript, METH_VARARGS | METH_KEYWORDS, PyDoc_STR("OutputLayerPatternPostscript(layer,filename) -> None")},
+	{"GetEpsilon"				, (PyCFunction)S4Sim_GetEpsilon, METH_VARARGS, PyDoc_STR("GetEpsilon(x,y,z) -> complex.  The analytic band-limited reconstruction; it does NOT reflect DiscretizedEpsilon or SubpixelSmoothing")},
+	{"OutputLayerPatternPostscript", (PyCFunction)S4Sim_OutputLayerPatternPostscript, METH_VARARGS | METH_KEYWORDS, PyDoc_STR("OutputLayerPatternPostscript(Layer=, Filename=) -> None.  Writes to stdout when Filename is omitted")},
 	{ "OutputLayerPatternRealization", (PyCFunction)S4Sim_OutputLayerPatternRealization, METH_VARARGS | METH_KEYWORDS, PyDoc_STR("OutputLayerPatternRealization(layer, nu, nv, filename) -> None")},
 	/* Outputs requiring solutions */
-	{"OutputStructurePOVRay"	, (PyCFunction)S4Sim_OutputStructurePOVRay, METH_VARARGS | METH_KEYWORDS, PyDoc_STR("OutputStructurePOVRay(filename) -> None")},
-	{"GetBasisSet"				, (PyCFunction)S4Sim_GetBasisSet, METH_NOARGS, PyDoc_STR("GetBasisSet() -> Tuple")},
-	{"GetAmplitudes"			, (PyCFunction)S4Sim_GetAmplitudes, METH_VARARGS | METH_KEYWORDS, PyDoc_STR("GetAmplitudes(layer,zoffset) -> Tuple")},
-	{"GetPowerFlux"				, (PyCFunction)S4Sim_GetPowerFlux, METH_VARARGS | METH_KEYWORDS, PyDoc_STR("GetPowerFlux(layer,zoffset) -> (forw,back)")},
-	{"GetPowerFluxByOrder"		, (PyCFunction)S4Sim_GetPowerFluxByOrder, METH_VARARGS | METH_KEYWORDS, PyDoc_STR("GetPowerFluxByOrder(layer,zoffset) -> Tuple")},
-	{"GetStressTensorIntegral"	, (PyCFunction)S4Sim_GetStressTensorIntegral, METH_VARARGS | METH_KEYWORDS, PyDoc_STR("GetStressTensorIntegral(layer,zoffset) -> Complex")},
-	{"GetLayerVolumeIntegral"	, (PyCFunction)S4Sim_GetLayerVolumeIntegral, METH_VARARGS | METH_KEYWORDS, PyDoc_STR("GetLayerVolumeIntegral(layer,which) -> Complex")},
-	{"GetLayerZIntegral"		, (PyCFunction)S4Sim_GetLayerZIntegral, METH_VARARGS | METH_KEYWORDS, PyDoc_STR("GetLayerZIntegral(layer,which,pos) -> Complex")},
+	{"OutputStructurePOVRay"	, (PyCFunction)S4Sim_OutputStructurePOVRay, METH_VARARGS | METH_KEYWORDS, PyDoc_STR("OutputStructurePOVRay(Filename=) -> None.  Writes to stdout when Filename is omitted")},
+	{"GetBasisSet"				, (PyCFunction)S4Sim_GetBasisSet, METH_NOARGS, PyDoc_STR("GetBasisSet() -> tuple of (m,n) reciprocal lattice orders actually in use")},
+	{"GetAmplitudes"			, (PyCFunction)S4Sim_GetAmplitudes, METH_VARARGS | METH_KEYWORDS, PyDoc_STR("GetAmplitudes(Layer=, zOffset=) -> (forward, backward) mode amplitudes")},
+	{"GetPowerFlux"				, (PyCFunction)S4Sim_GetPowerFlux, METH_VARARGS | METH_KEYWORDS, PyDoc_STR("GetPowerFlux(Layer=, zOffset=) -> (forward, backward).  Complex; take .real for the flux")},
+	{"GetPowerFluxByOrder"		, (PyCFunction)S4Sim_GetPowerFluxByOrder, METH_VARARGS | METH_KEYWORDS, PyDoc_STR("GetPowerFluxByOrder(Layer=, zOffset=) -> tuple of (forward, backward), ordered as GetBasisSet")},
+	{"GetStressTensorIntegral"	, (PyCFunction)S4Sim_GetStressTensorIntegral, METH_VARARGS | METH_KEYWORDS, PyDoc_STR("GetStressTensorIntegral(Layer=, zOffset=) -> tuple of complex")},
+	{"GetLayerVolumeIntegral"	, (PyCFunction)S4Sim_GetLayerVolumeIntegral, METH_VARARGS | METH_KEYWORDS, PyDoc_STR("GetLayerVolumeIntegral(Layer=, Quantity=) -> complex.  Quantity is 'U', 'E', 'H' or 'e'")},
+	{"GetLayerZIntegral"		, (PyCFunction)S4Sim_GetLayerZIntegral, METH_VARARGS | METH_KEYWORDS, PyDoc_STR("GetLayerZIntegral(Layer=, xy=) -> tuple of complex")},
 	/*
 	{"GetEField"				, (PyCFunction)S4Sim_GetEField, METH_VARARGS, PyDoc_STR("GetEField(x,y,z) -> (Tuple)")},
 	{"GetHField"				, (PyCFunction)S4Sim_GetHField, METH_VARARGS, PyDoc_STR("GetHField(x,y,z) -> (Tuple)")},
 	*/
-	{"GetFields"				, (PyCFunction)S4Sim_GetFields, METH_VARARGS, PyDoc_STR("GetFields(x,y,z) -> (Tuple,Tuple)")},
-	{"GetFieldsOnGrid"			, (PyCFunction)S4Sim_GetFieldsOnGrid, METH_VARARGS | METH_KEYWORDS, PyDoc_STR("GetFieldsOnGrid(z,nsamples,format,filename) -> Tuple")},
-	{"GetSMatrixDeterminant"	, (PyCFunction)S4Sim_GetSMatrixDeterminant, METH_NOARGS, PyDoc_STR("GetSMatrixDeterminant() -> Tuple")},
+	{"GetFields"				, (PyCFunction)S4Sim_GetFields, METH_VARARGS, PyDoc_STR("GetFields(x,y,z) -> (E, H), each a 3-tuple of complex")},
+	{"GetFieldsOnGrid"			, (PyCFunction)S4Sim_GetFieldsOnGrid, METH_VARARGS | METH_KEYWORDS, PyDoc_STR("GetFieldsOnGrid(z=, NumSamples=, Format=, BaseFilename=) -> (E, H).  Indexed [x][y]; the 2016 release indexed [y][x]")},
+	{"GetSMatrixDeterminant"	, (PyCFunction)S4Sim_GetSMatrixDeterminant, METH_NOARGS, PyDoc_STR("GetSMatrixDeterminant() -> tuple.  Underflows at any practical basis size; use for sign tracking only")},
 	/*
 	{"GetDiffractionOrder"		, (PyCFunction)S4Sim_GetDiffractionOrder, METH_VARARGS, PyDoc_STR("GetDiffractionOrder(m,n) -> order")},
 	*/
-	{"SetOptions"				, (PyCFunction)S4Sim_SetOptions, METH_VARARGS | METH_KEYWORDS, PyDoc_STR("SetOptions() -> None")},
-	{"GetPoyntingFlux"			, (PyCFunction)S4Sim_GetPowerFlux, METH_VARARGS | METH_KEYWORDS, PyDoc_STR("GetPoyntingFlux(layer,zoffset) -> (forw, back)")},
-	{"GetPoyntingFluxByOrder"	, (PyCFunction)S4Sim_GetPowerFluxByOrder, METH_VARARGS | METH_KEYWORDS, PyDoc_STR("GetPoyntingFluxByOrder(layer,zoffset) -> Tuple")},
+	{"SetOptions"				, (PyCFunction)S4Sim_SetOptions, METH_VARARGS | METH_KEYWORDS, PyDoc_STR("SetOptions(Verbosity=, LatticeTruncation=, DiscretizedEpsilon=, DiscretizationResolution=, PolarizationDecomposition=, PolarizationBasis=, LanczosSmoothing=, SubpixelSmoothing=, ConserveMemory=) -> None")},
+	{"GetOptions"				, (PyCFunction)S4Sim_GetOptions, METH_NOARGS, PyDoc_STR("GetOptions() -> dict of the options in force, plus NumBasis and NumBasisRequested")},
+	{"GetPoyntingFlux"			, (PyCFunction)S4Sim_GetPowerFlux, METH_VARARGS | METH_KEYWORDS, PyDoc_STR("GetPoyntingFlux(Layer=, zOffset=) -> (forward, backward).  Alias of GetPowerFlux")},
+	{"GetPoyntingFluxByOrder"	, (PyCFunction)S4Sim_GetPowerFluxByOrder, METH_VARARGS | METH_KEYWORDS, PyDoc_STR("GetPoyntingFluxByOrder(Layer=, zOffset=) -> tuple.  Alias of GetPowerFluxByOrder")},
 	/*
 	{"GetGList"					, (PyCFunction)S4Sim_GetGList, METH_VARARGS, PyDoc_STR("GetGList() -> Tuple")},
 	{"GetNumG"					, (PyCFunction)S4Sim_GetNumG, METH_VARARGS, PyDoc_STR("GetNumG() -> G num")},
@@ -1981,17 +2223,66 @@ static PyObject *S4_NewInterpolator(PyObject *self, PyObject *args, PyObject *kw
 }
 
 //didn't finished yet
+/* Solve the named layer in each of the given simulations.
+ *
+ * This parsed nothing and did nothing -- it accepted any arguments, or none,
+ * and returned None.  A caller got no error and no work, which is survivable
+ * only because the layer is solved again on demand later; the results were
+ * right, just not precomputed.
+ *
+ * The work is done one simulation after another.  The Lua frontend runs them
+ * on threads through helpers bound to a lua_State, which this binding has no
+ * equivalent of, and adding threads here would be a feature rather than a
+ * repair -- so the name still overpromises, and the docstring says so.
+ */
 static PyObject *S4_SolveInParallel(PyObject *Self, PyObject *args, PyObject *kwds)
 {
 	static char *kwlist[] = {"S4_Layer", "Simulations", NULL};
 	const char *layerName;
-	//S4_solve_in
+	PyObject *sims = NULL;
+	PyObject *seq = NULL;
+	Py_ssize_t n, i;
+
+	if(!S4_ParseKeywords(args, kwds, "sO:SolveInParallel", kwlist,
+		&layerName, &sims)){ return NULL; }
+
+	seq = PySequence_Fast(sims, "SolveInParallel: Simulations must be a sequence");
+	if(NULL == seq){ return NULL; }
+	n = PySequence_Fast_GET_SIZE(seq);
+	for(i = 0; i < n; ++i){
+		PyObject *o = PySequence_Fast_GET_ITEM(seq, i);   /* borrowed */
+		S4Sim *sim;
+		S4_LayerID layer;
+		int ret;
+		if(!PyObject_TypeCheck(o, &S4Sim_Type)){
+			Py_DECREF(seq);
+			PyErr_Format(PyExc_TypeError,
+				"SolveInParallel: Simulations[%zd] is not an S4 simulation", i);
+			return NULL;
+		}
+		sim = (S4Sim*)o;
+		layer = S4_Simulation_GetLayerByName(sim->S, layerName);
+		if(layer < 0){
+			Py_DECREF(seq);
+			PyErr_Format(PyExc_RuntimeError,
+				"SolveInParallel: S4_Layer named '%s' not found in Simulations[%zd].",
+				layerName, i);
+			return NULL;
+		}
+		ret = S4_Simulation_SolveLayer(sim->S, layer);
+		if(0 != ret){
+			Py_DECREF(seq);
+			HandleSolutionErrorCodeDetail("SolveInParallel", ret, sim->last_message);
+			return NULL;
+		}
+	}
+	Py_DECREF(seq);
 	Py_RETURN_NONE;
 }
 
 static PyMethodDef S4_funcs[] = {
 	{"New"				, (PyCFunction)S4_new, METH_VARARGS | METH_KEYWORDS, PyDoc_STR("New() -> new S4 simulation object")},
-	{"SolveInParallel"	, (PyCFunction)S4_SolveInParallel, METH_VARARGS | METH_KEYWORDS, PyDoc_STR("SolveInParallel(layer, sim_obj) -> None")},
+	{"SolveInParallel"	, (PyCFunction)S4_SolveInParallel, METH_VARARGS | METH_KEYWORDS, PyDoc_STR("SolveInParallel(S4_Layer, Simulations) -> None.  Solves the named layer in every simulation given; serially, despite the name.")},
 	{ "NewInterpolator"	, (PyCFunction)S4_NewInterpolator, METH_VARARGS | METH_KEYWORDS, PyDoc_STR("NewInterpolator(type, table) -> new S4 interpolator object") },
 	//{"PrintTuple"		, (PyCFunction)S4_PrintTuple, METH_VARARGS | METH_KEYWORDS, PyDoc_STR("PrintTuple(tuple) -> None")},
 	{ "NewSpectrumSampler", (PyCFunction)S4_NewSpectrumSampler, METH_VARARGS | METH_KEYWORDS, PyDoc_STR("NewSpectrumSampler() -> new S4 spectrum sampler onject")},
@@ -2047,6 +2338,18 @@ PyMODINIT_FUNC initS4(void)
 	}
 	Py_INCREF(st->error);
 	PyModule_AddObject(m, "Error", st->error);
+
+	/* Upstream exposes no version at all, so an importer cannot tell what it
+	 * has -- not the release, and not which build of it.  A result that cannot
+	 * be traced back to the source that produced it is not reproducible, and
+	 * this is the cheapest way to make that traceable. */
+	if(PyModule_AddStringConstant(m, "__version__", S4_VERSION) < 0
+	|| PyModule_AddStringConstant(m, "__release__", S4_FORK_VERSION) < 0
+	|| PyModule_AddStringConstant(m, "__build__", S4_BUILD_ID) < 0
+	|| PyModule_AddStringConstant(m, "__upstream__", S4_UPSTREAM) < 0){
+		Py_DECREF(m);
+		INITERROR;
+	}
 
 #if PY_MAJOR_VERSION >= 3
 	return m;
