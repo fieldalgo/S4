@@ -30,6 +30,7 @@ Severity is about what a user gets, not how hard it was to find:
 | 12 | A repeated layer name is accepted | `S4/S4.cpp` | silent |
 | 13 | A lattice basis with no cell is accepted | `S4/S4.cpp` | silent |
 | 14 | The ellipse tangent code drops a term, indexes by the loop count, and reads out of bounds | `S4/pattern/pattern.c` | silent |
+| 15 | `S4_Simulation_SetMessageHandler` has no `return` statement | `S4/S4.cpp` | crash |
 
 Two more that are real but change no result, listed at the end.
 
@@ -580,6 +581,48 @@ however fine it gets, while an ellipse's come from the smooth analytic tangent.
 
 So the fix is confirmed exactly where an identity exists, and elsewhere is only
 shown to be far closer to an independent construction than the code it replaces.
+
+---
+
+## 15. `S4_Simulation_SetMessageHandler` has no `return` statement
+
+`S4.cpp`, `S4_Simulation_SetMessageHandler`.
+
+It is declared to return an `S4_message_handler` and falls off the end:
+
+```c
+S4_message_handler S4_Simulation_SetMessageHandler(
+	S4_Simulation *S, S4_message_handler handler, void *data
+){
+	if(NULL == S){ return NULL; }
+	S->msg = handler;
+	S->msgdata = data;
+}
+```
+
+Flowing off the end of a non-void function is undefined behaviour in C++, and the
+compiler is entitled to assume the path is never taken. Unlike 1-14 this is latent
+on upstream master: neither frontend calls the function, so it is reachable only
+through the C API. This fork's Python binding installs a handler in `S4Sim_new`
+(`main_python.c`), which puts it on the path of every `New`:
+
+```python
+S = S4.New(Lattice=((1,0),(0,1)), NumBasis=9)   # *** stack smashing detected ***: terminated
+```
+
+Measured on Ubuntu 24.04 x86_64, gcc 13.3, Python 3.12, OpenBLAS 0.3.26, with the
+library built from `Makefile.local.example` at `-O3`: the process aborts before
+`New` returns. Rebuilt at `-O1 -g`, gdb shows the call from `S4Sim_new` arriving in
+`S4_Simulation_GetLattice` -- the next function in the object file -- with the
+handler's address as `Lr`, and its `memcpy` segfaults. The build says so up front:
+`S4.cpp:397: warning: control reaches end of non-void function [-Wreturn-type]`.
+The macOS arm64 / clang builds this fork was validated on cannot have hit it --
+every diagnostic calls `New` -- which undefined behaviour permits, and is why it
+went unnoticed.
+
+Fix offered: return the handler being replaced, which is what the return type
+implies (the `signal()` convention). With it, `validation/diagnostics.py` passes
+25/25 on the Linux build above.
 
 ---
 
