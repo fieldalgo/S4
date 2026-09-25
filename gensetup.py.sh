@@ -44,6 +44,15 @@ for _tok in '''$LIBS'''.split():
 	else:
 		_extra.append(_tok)
 
+# libS4.a is C++, and this extension is linked by the C compiler. On Linux the
+# C++ runtime is not pulled in implicitly, so without it the import fails on the
+# first operator new/delete (undefined symbol: _ZdaPv). The Lua targets in
+# Makefile.common pass -lstdc++ for the same reason. The macOS builds import
+# without it, so it is added on Linux only and they are left as they were.
+import sys
+if sys.platform.startswith('linux') and 'stdc++' not in _libs:
+	_libs.append('stdc++')
+
 S4module = Extension('S4',
 	sources = [
 		'S4/main_python.c'
