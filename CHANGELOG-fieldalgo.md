@@ -21,6 +21,29 @@ this line changed.
 
 ---
 
+## Unreleased
+
+### Fixed with no change to any result
+
+- **`S4.New` crashed on gcc builds.** `S4_Simulation_SetMessageHandler` is
+  declared to return the handler it replaces but had no `return` statement --
+  upstream since `ad2d419` (2017). Upstream never calls it; this line's
+  `S4Sim_new` does, on every `New`. Flowing off the end of a non-void C++
+  function is undefined, and with gcc 13 on Linux the call ran on into
+  `S4_Simulation_GetLattice`: "stack smashing detected" at `-O3`, a segfault in
+  that function's `memcpy` at `-O1 -g`. The macOS arm64 / clang builds this
+  line was validated on cannot have hit it -- every diagnostic calls `New` --
+  which undefined behaviour permits; gcc warns about it (`-Wreturn-type`,
+  `S4.cpp:397`). It now returns the previous handler. `UPSTREAM.md` item 15.
+  Patch-level under "Version numbers": no result can change.
+- **The Python extension did not import on Linux.** `libS4.a` is C++ and the
+  extension is linked by the C compiler, so on Linux `import S4` failed with
+  `undefined symbol: _ZdaPv`. `gensetup.py.sh` now adds `stdc++` to the
+  extension's libraries on Linux only, as the Lua targets in `Makefile.common`
+  already do; macOS builds are unchanged.
+
+---
+
 ## 0.1.0
 
 Fourteen defects fixed, all of them present in upstream master. `UPSTREAM.md`

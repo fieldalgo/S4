@@ -393,8 +393,10 @@ S4_message_handler S4_Simulation_SetMessageHandler(
 	S4_Simulation *S, S4_message_handler handler, void *data
 ){
 	if(NULL == S){ return NULL; }
+	S4_message_handler old = S->msg;
 	S->msg = handler;
 	S->msgdata = data;
+	return old;
 }
 
 int S4_Simulation_SetLattice(S4_Simulation *S, const S4_real *Lr){
